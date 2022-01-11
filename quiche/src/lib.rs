@@ -5226,7 +5226,9 @@ impl Connection {
                 },
 
             // TODO: implement connection migration
-            frame::Frame::NewConnectionId { .. } => (),
+            frame::Frame::NewConnectionId { seq_num, retire_prior_to, conn_id, reset_token } => {
+                trace!("NewConnectionId: seq_num {}, retire_prior_to {}, conn_id {:?} reset_token {:?}", seq_num, retire_prior_to, conn_id, reset_token);
+            },
 
             // TODO: implement connection migration
             frame::Frame::RetireConnectionId { .. } => (),
