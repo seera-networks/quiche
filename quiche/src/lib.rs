@@ -976,7 +976,7 @@ impl Config {
 #[derive(Debug)]
 struct ConnectionIdEntry {
     cid: ConnectionId<'static>,
-    seq: u64,
+    seq_num: u64,
 }
 
 /// A QUIC connection.
@@ -2212,12 +2212,14 @@ impl Connection {
             // Replace the randomly generated destination connection ID with
             // the one supplied by the server.
             self.dcid = hdr.scid.clone();
+            self.dcid_lists.push_back(ConnectionIdEntry{cid: hdr.scid.clone(), seq_num: 0});
 
             self.got_peer_conn_id = true;
         }
 
         if self.is_server && !self.got_peer_conn_id {
             self.dcid = hdr.scid.clone();
+            self.dcid_lists.push_back(ConnectionIdEntry{cid: hdr.scid.clone(), seq_num: 0});
 
             if !self.did_retry &&
                 (self.version >= PROTOCOL_VERSION_DRAFT28 ||
@@ -5237,8 +5239,8 @@ impl Connection {
 
             // TODO: implement connection migration
             frame::Frame::NewConnectionId { seq_num, retire_prior_to, conn_id, reset_token } => {
-                self.dcid_lists.push_back(ConnectionIdEntry{cid: ConnectionId::from_vec(conn_id), seq: seq_num});
-                trace!("dcid_lists after NewConnectionId {:?}", &self.dcid_lists);
+                self.dcid_lists.push_back(ConnectionIdEntry{cid: ConnectionId::from_vec(conn_id), seq_num: seq_num});
+                trace!("dcid_lists: {:?}", &self.dcid_lists);
             },
 
             // TODO: implement connection migration
