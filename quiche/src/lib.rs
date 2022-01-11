@@ -973,6 +973,12 @@ impl Config {
     }
 }
 
+#[derive(Debug)]
+struct ConnectionIdEntry {
+    cid: ConnectionId<'static>,
+    seq: u64,
+}
+
 /// A QUIC connection.
 pub struct Connection {
     /// QUIC wire version used for the connection.
@@ -980,6 +986,9 @@ pub struct Connection {
 
     /// Peer's connection ID.
     dcid: ConnectionId<'static>,
+
+    /// List of Peer's connection IDs
+    dcid_lists: VecDeque<ConnectionIdEntry>,
 
     /// Local connection ID.
     scid: ConnectionId<'static>,
@@ -1436,6 +1445,7 @@ impl Connection {
             version: config.version,
 
             dcid: ConnectionId::default(),
+            dcid_lists: VecDeque::new(),
             scid: scid.to_vec().into(),
 
             trace_id: scid_as_hex.join(""),
@@ -5227,7 +5237,8 @@ impl Connection {
 
             // TODO: implement connection migration
             frame::Frame::NewConnectionId { seq_num, retire_prior_to, conn_id, reset_token } => {
-                trace!("NewConnectionId: seq_num {}, retire_prior_to {}, conn_id {:?} reset_token {:?}", seq_num, retire_prior_to, conn_id, reset_token);
+                self.dcid_lists.push_back(ConnectionIdEntry{cid: ConnectionId::from_vec(conn_id), seq: seq_num});
+                trace!("dcid_lists after NewConnectionId {:?}", &self.dcid_lists);
             },
 
             // TODO: implement connection migration
