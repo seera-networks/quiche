@@ -141,7 +141,7 @@ impl PacketHeader {
                 None,
                 None,
                 None,
-                None,
+                dcid,
             ),
 
             _ => PacketHeader::new(
