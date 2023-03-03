@@ -792,6 +792,10 @@ fn handle_path_events(client: &mut Client) {
                     .map_err(|e| error!("cannot follow status request: {}", e))
                     .ok();
             },
+
+            quiche::PathEvent::InsertGroup(..) => {},
+
+            quiche::PathEvent::RemoveGroup(..) => {},
         }
     }
 }
