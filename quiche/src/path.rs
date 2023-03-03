@@ -24,9 +24,11 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::convert::TryInto;
 use std::time;
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 
@@ -179,6 +181,10 @@ pub enum PathEvent {
 
     /// The peer advertised the path status for the mentioned 4-tuple.
     PeerPathStatus((SocketAddr, SocketAddr), PathStatus),
+
+    InsertGroup(u64, (SocketAddr, SocketAddr)),
+
+    RemoveGroup(u64, (SocketAddr, SocketAddr)),
 }
 
 /// A network path on which QUIC packets can be sent.
@@ -654,11 +660,81 @@ impl ExactSizeIterator for SocketAddrIter {
     }
 }
 
+pub struct PathGroup {
+    paths: HashSet<usize>,
+    advertise_insert_pid: VecDeque<usize>,
+    advertise_remove_pid: VecDeque<usize>,
+}
+
+impl PathGroup {
+    pub fn new() -> Self {
+        Self {
+            paths: HashSet::new(),
+            advertise_insert_pid: VecDeque::new(),
+            advertise_remove_pid: VecDeque::new()
+        }
+    }
+
+    pub fn get(&self) -> Vec<usize> {
+        self.paths
+            .iter()
+            .copied()
+            .collect::<Vec<usize>>()
+    }
+
+    #[inline]
+    pub fn insert(&mut self, pid: usize) -> bool {
+        self.paths.insert(pid)
+    }
+
+    #[inline]
+    pub fn remove(&mut self, pid: usize) -> bool {
+        self.paths.remove(&pid)
+    }
+
+    fn mark_advertise_insert_pid(&mut self, pid: usize, advertise: bool) {
+        if advertise {
+            self.advertise_insert_pid.push_back(pid);
+        } else if let Some(index) = self
+            .advertise_insert_pid
+            .iter()
+            .position(|s| *s == pid)
+        {
+            self.advertise_insert_pid.remove(index);
+        }
+    }
+
+    fn mark_advertise_remove_pid(&mut self, pid: usize, advertise: bool) {
+        if advertise {
+            self.advertise_remove_pid.push_back(pid);
+        } else if let Some(index) = self
+            .advertise_remove_pid
+            .iter()
+            .position(|s| *s == pid)
+        {
+            self.advertise_remove_pid.remove(index);
+        }
+    }
+
+    #[inline]
+    pub fn next_advertise_insert_pid(&self) -> Option<usize> {
+        self.advertise_insert_pid.front().copied()
+    }
+
+    #[inline]
+    pub fn next_advertise_remove_pid(&self) -> Option<usize> {
+        self.advertise_remove_pid.front().copied()
+    }
+}
+
 /// All path-related information.
 pub struct PathMap {
     /// The paths of the connection. Each of them has an internal identifier
     /// that is used by `addrs_to_paths` and `ConnectionEntry`.
     paths: Slab<Path>,
+
+    /// The groups of the paths
+    groups: Slab<PathGroup>,
 
     /// The maximum number of concurrent paths allowed.
     max_concurrent_paths: usize,
@@ -692,6 +768,7 @@ impl PathMap {
         mut initial_path: Path, max_concurrent_paths: usize, is_server: bool,
     ) -> Self {
         let mut paths = Slab::with_capacity(1); // most connections only have one path
+        let mut groups = Slab::with_capacity(1);
         let mut addrs_to_paths = BTreeMap::new();
 
         let local_addr = initial_path.local_addr;
@@ -701,10 +778,17 @@ impl PathMap {
         initial_path.state = PathState::Active;
 
         let active_path_id = paths.insert(initial_path);
+
+        let mut initial_group = PathGroup::new();
+        initial_group.insert(active_path_id);
+        let initial_group_id = groups.insert(initial_group);
+        assert_eq!(initial_group_id, 0);
+
         addrs_to_paths.insert((local_addr, peer_addr), active_path_id);
 
         Self {
             paths,
+            groups,
             max_concurrent_paths,
             addrs_to_paths,
             events: VecDeque::new(),
@@ -880,9 +964,98 @@ impl PathMap {
             self.notify_event(PathEvent::New(local_addr, peer_addr));
         }
 
+        if self.insert_group(0, pid, is_server)? {
+            warn!("Newly inserted path already exists!");
+        }
+
         Ok(pid)
     }
 
+    /// Gets an immutable reference to the group identified by `group_id`. If the
+    /// provided `group_id` does not identify any current `PathGroup`, returns an
+    /// [`InvalidState`].
+    ///
+    /// [`InvalidState`]: enum.Error.html#variant.InvalidState
+    #[inline]
+    pub fn get_group_pid(&self, group_id: u64) -> Result<Vec<usize>> {
+        self.groups
+            .get(group_id.try_into().unwrap())
+            .map(|v| v.get())
+            .ok_or(Error::InvalidState)
+    }
+
+    /// Records the provided `PathGroup` and returns its assigned identifier.
+    ///
+    /// On success, this method takes care of creating a notification to the
+    /// serving application, if it serves a server-side connection.
+    ///
+    /// [`Done`]: enum.Error.html#variant.Done
+    pub fn insert_group(&mut self, group_id: u64, path_id: usize, is_server: bool) -> Result<bool> {
+        let path = self.get(path_id)?;
+        let local_addr = path.local_addr;
+        let peer_addr = path.peer_addr;
+
+        if !self.groups.contains(group_id.try_into().unwrap()) {
+            self.groups.insert(PathGroup::new());
+        }
+
+        let inserted = self.groups
+            .get_mut(group_id.try_into().unwrap())
+            .unwrap()
+            .insert(path_id);
+
+        if inserted { 
+            if !is_server {
+                if group_id > 0 {
+                    self.mark_advertise_insert_pid(group_id, path_id, true)?;
+                }
+            } else {
+                // Notifies the application if we are in server mode.
+                self.notify_event(PathEvent::InsertGroup(group_id, (local_addr, peer_addr)));
+            }
+        }
+
+        Ok(inserted)
+    }
+
+    pub fn mark_advertise_insert_pid(&mut self, group_id: u64, path_id: usize, advertise: bool) -> Result<()> {
+        self.groups
+            .get_mut(group_id.try_into().unwrap())
+            .and_then(|v| Some(v.mark_advertise_insert_pid(path_id, advertise)))
+            .ok_or(Error::InvalidState)
+    }
+
+    pub fn mark_advertise_remove_pid(&mut self, group_id: u64, path_id: usize, advertise: bool) -> Result<()> {
+        self.groups
+            .get_mut(group_id.try_into().unwrap())
+            .and_then(|v| Some(v.mark_advertise_remove_pid(path_id, advertise)))
+            .ok_or(Error::InvalidState)
+    }
+
+    pub fn next_advertise_insert_pid(&self) -> Option<(u64, usize)> {
+        self.groups
+            .iter()
+            .filter_map(|(gid, v)| {
+                v.next_advertise_insert_pid()
+                    .map(|pid| {
+                        (gid.try_into().unwrap(), pid)
+                    })
+            })
+            .next()
+    }
+
+    pub fn next_advertise_remove_pid(&self) -> Option<(u64, usize)> {
+        self.groups
+            .iter()
+            .filter_map(|(gid, v)| {
+                v.next_advertise_remove_pid()
+                    .map(|pid| {
+                        (gid.try_into().unwrap(), pid)
+                    })
+            })
+            .next()
+    }
+    
     /// Notifies a path event to the application served by the connection.
     pub fn notify_event(&mut self, ev: PathEvent) {
         self.events.push_back(ev);

@@ -198,6 +198,16 @@ pub enum Frame {
         seq_num: u64,
         status: u64,
     },
+
+    PathInsertGroup {
+        group_identifier: u64,
+        path_identifier: u64
+    },
+
+    PathRemoveGroup {
+        group_identifier: u64,
+        path_identifier: u64
+    },
 }
 
 impl Frame {
@@ -364,6 +374,26 @@ impl Frame {
                 }
             },
 
+            0xbaba07 => {
+                let group_identifier = b.get_varint()?;
+                let path_identifier = b.get_varint()?;
+
+                Frame::PathInsertGroup {
+                    group_identifier,
+                    path_identifier,
+                }
+            },
+
+            0xbaba08 => {
+                let group_identifier = b.get_varint()?;
+                let path_identifier = b.get_varint()?;
+
+                Frame::PathRemoveGroup {
+                    group_identifier,
+                    path_identifier,
+                }
+            },
+
             _ => return Err(Error::InvalidFrame),
         };
 
@@ -384,6 +414,8 @@ impl Frame {
             (packet::Type::ZeroRTT, Frame::ACKMP { .. }) => false,
             (packet::Type::ZeroRTT, Frame::PathAbandon { .. }) => false,
             (packet::Type::ZeroRTT, Frame::PathStatus { .. }) => false,
+            (packet::Type::ZeroRTT, Frame::PathInsertGroup { .. }) => false,
+            (packet::Type::ZeroRTT, Frame::PathRemoveGroup { .. }) => false,
 
             // ACK, CRYPTO and CONNECTION_CLOSE can be sent on all other packet
             // types.
@@ -651,6 +683,26 @@ impl Frame {
                 b.put_varint(*seq_num)?;
                 b.put_varint(*status)?;
             },
+
+            Frame::PathInsertGroup {
+                group_identifier,
+                path_identifier,
+            } => {
+                b.put_varint(0xbaba07)?;
+
+                b.put_varint(*group_identifier)?;
+                b.put_varint(*path_identifier)?;
+            },
+
+            Frame::PathRemoveGroup {
+                group_identifier,
+                path_identifier,
+            } => {
+                b.put_varint(0xbaba08)?;
+
+                b.put_varint(*group_identifier)?;
+                b.put_varint(*path_identifier)?;
+            },
         }
 
         Ok(before - b.cap())
@@ -879,6 +931,24 @@ impl Frame {
                 path_identifier_size +
                 octets::varint_len(*seq_num) +
                 octets::varint_len(*status)
+            },
+
+            Frame::PathInsertGroup {
+                group_identifier,
+                path_identifier,
+            } => {
+                4 + // frame size
+                octets::varint_len(*group_identifier) +
+                octets::varint_len(*path_identifier)
+            },
+
+            Frame::PathRemoveGroup {
+                group_identifier,
+                path_identifier,
+            } => {
+                4 + // frame size
+                octets::varint_len(*group_identifier) +
+                octets::varint_len(*path_identifier)
             },
         }
     }
@@ -1144,6 +1214,22 @@ impl Frame {
                 seq_num: *seq_num,
                 status: *status,
             },
+
+            Frame::PathInsertGroup {
+                group_identifier,
+                path_identifier,
+            } => QuicFrame::PathInsertGroup {
+                group_identifier: *group_identifier,
+                path_identifier: *path_identifier,
+            },
+
+            Frame::PathRemoveGroup {
+                group_identifier,
+                path_identifier,
+            } => QuicFrame::PathRemoveGroup {
+                group_identifier: *group_identifier,
+                path_identifier: *path_identifier,
+            },
         }
     }
 }
@@ -1347,6 +1433,27 @@ impl std::fmt::Debug for Frame {
                     "PATH_STATUS id_type={identifier_type} path_id={path_identifier:x?} seq_num={seq_num:x} status={status:x}",
                 )?;
             },
+
+            Frame::PathInsertGroup {
+                group_identifier,
+                path_identifier,
+            } => {
+                write!(
+                    f,
+                    "PATH_INSERT_GROUP group_id_type={group_identifier:x} path_id={path_identifier:x}",
+                )?;
+            },
+
+            Frame::PathRemoveGroup {
+                group_identifier,
+                path_identifier,
+            } => {
+                write!(
+                    f,
+                    "PATH_REMOVE_GROUP group_id_type={group_identifier:x} path_id={path_identifier:x}",
+                )?;
+            },
+
         }
 
         Ok(())

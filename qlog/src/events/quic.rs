@@ -526,6 +526,16 @@ pub enum QuicFrame {
         status: u64,
     },
 
+    PathInsertGroup {
+        group_identifier: u64,
+        path_identifier: u64,
+    },
+
+    PathRemoveGroup {
+        group_identifier: u64,
+        path_identifier: u64,
+    },
+
     Unknown {
         raw_frame_type: u64,
         raw_length: Option<u32>,

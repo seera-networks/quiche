@@ -3926,6 +3926,22 @@ impl Connection {
                     break;
                 }
             }
+
+            while let Some((group_identifier, path_id)) = self.paths.next_advertise_insert_pid()
+            {
+                let path = self.paths.get(path_id)?;
+                if let Some(path_identifier) = path.active_scid_seq {
+                    let frame = frame::Frame::PathInsertGroup {
+                        group_identifier,
+                        path_identifier,
+                    };
+                    if push_frame_to_pkt!(b, frames, frame, left) {
+                        self.paths.mark_advertise_insert_pid(group_identifier, path_id, false)?;        
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
 
         let path = self.paths.get_mut(send_pid)?;
@@ -5834,6 +5850,15 @@ impl Connection {
         Ok(())
     }
 
+    pub fn insert_group(&mut self, local: SocketAddr, peer: SocketAddr, group_id: u64) -> Result<bool> {
+        if let Some(path_id) = self.paths.path_id_from_addrs(&(local, peer)) {
+            println!("insert_group: path_id={path_id}, local={local:?}, peer={peer:?}");
+            self.paths.insert_group(group_id, path_id, self.is_server)
+        } else {
+            Err(Error::InvalidState)
+        }
+    }
+
     /// Provides additional source Connection IDs that the peer can use to reach
     /// this host.
     ///
@@ -7289,6 +7314,21 @@ impl Connection {
                 )?;
                 self.paths.on_path_status_received(pid, seq_num, status);
             },
+
+            frame::Frame::PathInsertGroup {
+                group_identifier,
+                path_identifier,
+            } => {
+                println!("PathInsertGroup: gid={group_identifier}, pid={path_identifier}");
+            }
+
+            frame::Frame::PathRemoveGroup {
+                group_identifier,
+                path_identifier,
+            } => {
+                println!("PathRemoveGroup: gid={group_identifier}, pid={path_identifier}");
+            }
+
         };
         Ok(())
     }

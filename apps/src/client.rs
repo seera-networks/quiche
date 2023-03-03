@@ -28,6 +28,7 @@ use crate::args::*;
 use crate::common::*;
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 
 use std::io::prelude::*;
@@ -462,6 +463,10 @@ pub fn connect(
                 quiche::PathEvent::PeerMigrated(..) => unreachable!(),
 
                 quiche::PathEvent::PeerPathStatus(..) => {},
+
+                quiche::PathEvent::InsertGroup(..) => {},
+
+                quiche::PathEvent::RemoveGroup(..) => {},
             }
         }
 
@@ -486,6 +491,7 @@ pub fn connect(
             conn.available_dcids() > 0 &&
             conn.probe_path(addrs[probed_paths], peer_addr).is_ok()
         {
+            conn.insert_group(addrs[probed_paths], peer_addr, 1);
             probed_paths += 1;
         }
 
@@ -507,6 +513,7 @@ pub fn connect(
         // Generate outgoing QUIC packets and send them on the UDP socket, until
         // quiche reports that there are no more packets to be sent.
         for (local_addr, peer_addr) in scheduled_tuples {
+            println!("local_addr: {}, peer_addr: {}", local_addr, peer_addr);
             let token = src_addr_to_token[&local_addr];
             let socket = &sockets[token];
             loop {
