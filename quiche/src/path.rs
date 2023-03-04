@@ -922,7 +922,7 @@ impl PathMap {
     ///
     /// [`InvalidState`]: enum.Error.html#variant.InvalidState
     #[inline]
-    pub fn get_group_pid(&self, group_id: u64) -> Result<Vec<usize>> {
+    pub fn get_group(&self, group_id: u64) -> Result<Vec<usize>> {
         let pids = self.groups
             .get(&group_id)
             .ok_or(Error::InvalidState)?
@@ -1311,8 +1311,14 @@ impl PathMap {
             })
     }
 
+    pub fn on_path_set_group_lost(&mut self, group_id: u64, seq_num: u64) {
+        if self.next_path_set_group_seq_num == seq_num.saturating_add(1) {
+            // No newer Frame sent
+            self.mark_advertise_path_set_group(group_id, true);
+        }
+    }
+
     pub fn on_path_set_group_received(&mut self, group_id: u64, seq_num: u64, path_ids: Vec<usize>) -> Result<()> {
-        println!("path_ids: {:?}", path_ids);
         if seq_num >= self.expected_path_set_group_seq_num {
             self.expected_path_set_group_seq_num = seq_num.saturating_add(1);
 
@@ -1324,12 +1330,10 @@ impl PathMap {
             let new_path_ids = HashSet::from_iter(path_ids.into_iter());
 
             for pid in new_path_ids.difference(&old_path_ids) {
-                println!("Add {}", *pid);
                 self.insert_group(group_id, *pid, true)?;
             }
 
             for pid in old_path_ids.difference(&new_path_ids) {
-                println!("Delete {}", *pid);
                 self.remove_group(group_id, *pid, true)?;
             }
         }
