@@ -3927,19 +3927,18 @@ impl Connection {
                 }
             }
 
-            while let Some((group_identifier, path_id)) = self.paths.next_advertise_insert_pid()
+            while let Some((group_identifier, pid)) = self.paths.next_advertise_insert_pid()
             {
-                let path = self.paths.get(path_id)?;
-                if let Some(path_identifier) = path.active_scid_seq {
-                    let frame = frame::Frame::PathInsertGroup {
-                        group_identifier,
-                        path_identifier,
-                    };
-                    if push_frame_to_pkt!(b, frames, frame, left) {
-                        self.paths.mark_advertise_insert_pid(group_identifier, path_id, false)?;        
-                    } else {
-                        break;
-                    }
+                let inserted_path = self.paths.get(pid)?;
+                let path_identifier = inserted_path.active_scid_seq.ok_or(Error::InvalidState)?;
+                let frame = frame::Frame::PathInsertGroup {
+                    group_identifier,
+                    path_identifier,
+                };
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.paths.mark_advertise_insert_pid(group_identifier, pid, false)?;        
+                } else {
+                    break;
                 }
             }
         }
@@ -5852,11 +5851,13 @@ impl Connection {
 
     pub fn insert_group(&mut self, local: SocketAddr, peer: SocketAddr, group_id: u64) -> Result<bool> {
         if let Some(path_id) = self.paths.path_id_from_addrs(&(local, peer)) {
-            println!("insert_group: path_id={path_id}, local={local:?}, peer={peer:?}");
-            self.paths.insert_group(group_id, path_id, self.is_server)
-        } else {
-            Err(Error::InvalidState)
+            info!("insert_group: path_id={path_id}, local={local:?}, peer={peer:?}");
+            let path = self.paths.get(path_id)?;
+            if path.active_scid_seq.is_some() {
+                return self.paths.insert_group(group_id, path_id, self.is_server);
+            }
         }
+        Err(Error::InvalidState)
     }
 
     /// Provides additional source Connection IDs that the peer can use to reach
@@ -7145,8 +7146,7 @@ impl Connection {
 
             frame::Frame::PathChallenge { data } => {
                 self.paths
-                    .get_mut(recv_path_id)?
-                    .on_challenge_received(data);
+                    .on_challenge_received(recv_path_id, data, self.is_server)?;
             },
 
             frame::Frame::PathResponse { data } => {
@@ -7319,8 +7319,12 @@ impl Connection {
                 group_identifier,
                 path_identifier,
             } => {
-                println!("PathInsertGroup: gid={group_identifier}, pid={path_identifier}");
-            }
+                let path_id = self.ids
+                    .get_dcid(path_identifier)?
+                    .path_id
+                    .ok_or(Error::InvalidFrame)?;
+                self.paths.insert_group(group_identifier, path_id, self.is_server)?;
+            },
 
             frame::Frame::PathRemoveGroup {
                 group_identifier,

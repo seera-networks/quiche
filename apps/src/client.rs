@@ -442,6 +442,14 @@ pub fn connect(
                     );
                 },
 
+                quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
+                    info!(
+                        "Path ({}, {})'s return path is available",
+                        local_addr, peer_addr
+                    );
+                    conn.insert_group(local_addr, peer_addr, 1).unwrap();
+                }
+
                 quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
                     info!(
                         "Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
@@ -491,7 +499,6 @@ pub fn connect(
             conn.available_dcids() > 0 &&
             conn.probe_path(addrs[probed_paths], peer_addr).is_ok()
         {
-            conn.insert_group(addrs[probed_paths], peer_addr, 1);
             probed_paths += 1;
         }
 
@@ -503,7 +510,6 @@ pub fn connect(
         {
             let additional_local_addr = sockets[1].local_addr().unwrap();
             conn.probe_path(additional_local_addr, peer_addr).unwrap();
-
             new_path_probed = true;
         }
 

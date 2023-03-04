@@ -158,6 +158,8 @@ pub enum PathEvent {
     /// anymore, unless the application requests probing this path again.
     FailedValidation(SocketAddr, SocketAddr),
 
+    ReturnAvailable(SocketAddr, SocketAddr),
+
     /// The related network path between local `SocketAddr` and peer
     /// `SocketAddr` has been closed and is now unusable on this connection.
     /// An error code and a reason message are provided.
@@ -1114,6 +1116,17 @@ impl PathMap {
         self.iter().filter(|(_, p)| !p.is_standby()).count() == 0
     }
 
+    pub fn on_challenge_received(&mut self, path_id: usize, data: [u8; 8], is_server: bool) -> Result<()> {
+        let path = self.get_mut(path_id)?;
+        path.on_challenge_received(data);
+        if !is_server {
+            let local_addr = path.local_addr;
+            let peer_addr = path.peer_addr;
+                // Notifies the application.
+                self.notify_event(PathEvent::ReturnAvailable(local_addr, peer_addr));
+        }
+        Ok(())
+    }
     /// Handles incoming PATH_RESPONSE data.
     pub fn on_response_received(&mut self, data: [u8; 8]) -> Result<()> {
         let active_pid = self.get_active_path_id()?;

@@ -793,7 +793,11 @@ fn handle_path_events(client: &mut Client) {
                     .ok();
             },
 
-            quiche::PathEvent::InsertGroup(..) => {},
+            quiche::PathEvent::ReturnAvailable(..) => {},
+
+            quiche::PathEvent::InsertGroup(group_id, addr) => {
+                info!("Peer inserts {:?} into {} group", addr, group_id);
+            },
 
             quiche::PathEvent::RemoveGroup(..) => {},
         }
