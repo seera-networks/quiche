@@ -199,14 +199,10 @@ pub enum Frame {
         status: u64,
     },
 
-    PathInsertGroup {
+    PathSetGroup {
         group_identifier: u64,
-        path_identifier: u64
-    },
-
-    PathRemoveGroup {
-        group_identifier: u64,
-        path_identifier: u64
+        seq_num: u64,
+        path_identifiers: Vec<u64>,
     },
 }
 
@@ -376,21 +372,18 @@ impl Frame {
 
             0xbaba07 => {
                 let group_identifier = b.get_varint()?;
-                let path_identifier = b.get_varint()?;
-
-                Frame::PathInsertGroup {
-                    group_identifier,
-                    path_identifier,
+                let seq_num = b.get_varint()?;
+                let id_count = b.get_varint()?;
+                let mut path_identifiers = Vec::new();
+                for _ in 0..id_count {
+                    let pid = b.get_varint()?;
+                    path_identifiers.push(pid);
                 }
-            },
-
-            0xbaba08 => {
-                let group_identifier = b.get_varint()?;
-                let path_identifier = b.get_varint()?;
-
-                Frame::PathRemoveGroup {
+                
+                Frame::PathSetGroup {
                     group_identifier,
-                    path_identifier,
+                    seq_num,
+                    path_identifiers,
                 }
             },
 
@@ -414,8 +407,7 @@ impl Frame {
             (packet::Type::ZeroRTT, Frame::ACKMP { .. }) => false,
             (packet::Type::ZeroRTT, Frame::PathAbandon { .. }) => false,
             (packet::Type::ZeroRTT, Frame::PathStatus { .. }) => false,
-            (packet::Type::ZeroRTT, Frame::PathInsertGroup { .. }) => false,
-            (packet::Type::ZeroRTT, Frame::PathRemoveGroup { .. }) => false,
+            (packet::Type::ZeroRTT, Frame::PathSetGroup { .. }) => false,
 
             // ACK, CRYPTO and CONNECTION_CLOSE can be sent on all other packet
             // types.
@@ -684,25 +676,21 @@ impl Frame {
                 b.put_varint(*status)?;
             },
 
-            Frame::PathInsertGroup {
+            Frame::PathSetGroup {
                 group_identifier,
-                path_identifier,
+                seq_num,
+                path_identifiers,
             } => {
                 b.put_varint(0xbaba07)?;
 
                 b.put_varint(*group_identifier)?;
-                b.put_varint(*path_identifier)?;
+                b.put_varint(*seq_num)?;
+                b.put_varint(path_identifiers.len() as u64)?;
+                for pid in path_identifiers {
+                    b.put_varint(*pid)?;
+                }                
             },
 
-            Frame::PathRemoveGroup {
-                group_identifier,
-                path_identifier,
-            } => {
-                b.put_varint(0xbaba08)?;
-
-                b.put_varint(*group_identifier)?;
-                b.put_varint(*path_identifier)?;
-            },
         }
 
         Ok(before - b.cap())
@@ -933,22 +921,19 @@ impl Frame {
                 octets::varint_len(*status)
             },
 
-            Frame::PathInsertGroup {
+            Frame::PathSetGroup {
                 group_identifier,
-                path_identifier,
+                seq_num,
+                path_identifiers,
             } => {
+                let total_pid_len = path_identifiers.iter()
+                    .map(|pid| octets::varint_len(*pid))
+                    .sum::<usize>();
                 4 + // frame size
                 octets::varint_len(*group_identifier) +
-                octets::varint_len(*path_identifier)
-            },
-
-            Frame::PathRemoveGroup {
-                group_identifier,
-                path_identifier,
-            } => {
-                4 + // frame size
-                octets::varint_len(*group_identifier) +
-                octets::varint_len(*path_identifier)
+                octets::varint_len(*seq_num) +
+                octets::varint_len(path_identifiers.len() as u64) +
+                total_pid_len
             },
         }
     }
@@ -1215,21 +1200,16 @@ impl Frame {
                 status: *status,
             },
 
-            Frame::PathInsertGroup {
+            Frame::PathSetGroup {
                 group_identifier,
-                path_identifier,
-            } => QuicFrame::PathInsertGroup {
+                seq_num,
+                path_identifiers,
+            } => QuicFrame::PathSetGroup {
                 group_identifier: *group_identifier,
-                path_identifier: *path_identifier,
+                seq_num: *seq_num,
+                path_identifiers: path_identifiers.clone(),
             },
 
-            Frame::PathRemoveGroup {
-                group_identifier,
-                path_identifier,
-            } => QuicFrame::PathRemoveGroup {
-                group_identifier: *group_identifier,
-                path_identifier: *path_identifier,
-            },
         }
     }
 }
@@ -1434,26 +1414,16 @@ impl std::fmt::Debug for Frame {
                 )?;
             },
 
-            Frame::PathInsertGroup {
+            Frame::PathSetGroup {
                 group_identifier,
-                path_identifier,
+                seq_num,
+                path_identifiers,
             } => {
                 write!(
                     f,
-                    "PATH_INSERT_GROUP group_id_type={group_identifier:x} path_id={path_identifier:x}",
+                    "PATH_SET_GROUP group_id={group_identifier:x} seq_num={seq_num:x} path_ids={path_identifiers:?}",
                 )?;
             },
-
-            Frame::PathRemoveGroup {
-                group_identifier,
-                path_identifier,
-            } => {
-                write!(
-                    f,
-                    "PATH_REMOVE_GROUP group_id_type={group_identifier:x} path_id={path_identifier:x}",
-                )?;
-            },
-
         }
 
         Ok(())
@@ -2650,48 +2620,17 @@ mod tests {
     }
 
     #[test]
-    fn path_insert_group() {
-        let mut d = [42; 128];
-
-        let group_identifier = 0x20a010e6;
-        let path_identifier = 0x42ead9d9;
-
-        let frame = Frame::PathInsertGroup {
-            group_identifier,
-            path_identifier,
-        };
-
-        let wire_len = {
-            let mut b = octets::OctetsMut::with_slice(&mut d);
-            frame.to_bytes(&mut b).unwrap()
-        };
-
-        assert_eq!(frame.wire_len(), wire_len);
-        assert_eq!(wire_len, 16);
-
-        let mut b = octets::Octets::with_slice(&d);
-        assert_eq!(Frame::from_bytes(&mut b, packet::Type::Short), Ok(frame));
-
-        let mut b = octets::Octets::with_slice(&d);
-        assert!(Frame::from_bytes(&mut b, packet::Type::Initial).is_err());
-
-        let mut b = octets::Octets::with_slice(&d);
-        assert!(Frame::from_bytes(&mut b, packet::Type::ZeroRTT).is_err());
-
-        let mut b = octets::Octets::with_slice(&d);
-        assert!(Frame::from_bytes(&mut b, packet::Type::Handshake).is_err());
-    }
-
-    #[test]
-    fn path_remove_group() {
+    fn path_set_group() {
         let mut d = [42; 128];
 
         let group_identifier = 0x829f06d7;
-        let path_identifier = 0x378a1fa0;
+        let seq_num = 0x00;
+        let path_identifiers = vec![0x00, 0x40, 0x4000, 0x40000000];
 
-        let frame = Frame::PathRemoveGroup {
+        let frame = Frame::PathSetGroup {
             group_identifier,
-            path_identifier,
+            seq_num,
+            path_identifiers,
         };
 
         let wire_len = {
@@ -2700,7 +2639,7 @@ mod tests {
         };
 
         assert_eq!(frame.wire_len(), wire_len);
-        assert_eq!(wire_len, 16);
+        assert_eq!(wire_len, 29);
 
         let mut b = octets::Octets::with_slice(&d);
         assert_eq!(Frame::from_bytes(&mut b, packet::Type::Short), Ok(frame));

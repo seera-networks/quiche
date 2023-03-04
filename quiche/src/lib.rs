@@ -3927,16 +3927,29 @@ impl Connection {
                 }
             }
 
-            while let Some((group_identifier, pid)) = self.paths.next_advertise_insert_pid()
+            while let Some((group_identifier, seq_num)) = self.paths.next_advertise_path_set_group()
             {
-                let inserted_path = self.paths.get(pid)?;
-                let path_identifier = inserted_path.active_scid_seq.ok_or(Error::InvalidState)?;
-                let frame = frame::Frame::PathInsertGroup {
+                let pids = self.paths.get_group_pid(group_identifier)?;
+                let path_identifiers = pids.iter()
+                    .map(|pid| {
+                        self.paths
+                            .get(*pid)
+                            .and_then(|p| {
+                                p.active_scid_seq
+                                    .ok_or(Error::InvalidState)
+                            })
+                    })
+                    .collect::<Result<Vec<u64>>>()?;
+                
+                let frame = frame::Frame::PathSetGroup {
                     group_identifier,
-                    path_identifier,
+                    seq_num,
+                    path_identifiers,
                 };
                 if push_frame_to_pkt!(b, frames, frame, left) {
-                    self.paths.mark_advertise_insert_pid(group_identifier, pid, false)?;        
+                    self.paths.mark_advertise_path_set_group(group_identifier, false);       
+                    ack_eliciting = true;
+                    in_flight = true;
                 } else {
                     break;
                 }
@@ -7315,22 +7328,12 @@ impl Connection {
                 self.paths.on_path_status_received(pid, seq_num, status);
             },
 
-            frame::Frame::PathInsertGroup {
+            frame::Frame::PathSetGroup {
                 group_identifier,
-                path_identifier,
+                seq_num,
+                path_identifiers,
             } => {
-                let path_id = self.ids
-                    .get_dcid(path_identifier)?
-                    .path_id
-                    .ok_or(Error::InvalidFrame)?;
-                self.paths.insert_group(group_identifier, path_id, self.is_server)?;
-            },
-
-            frame::Frame::PathRemoveGroup {
-                group_identifier,
-                path_identifier,
-            } => {
-                println!("PathRemoveGroup: gid={group_identifier}, pid={path_identifier}");
+                println!("PathSetGroup: gid={group_identifier}, seq_num={seq_num}, pids={path_identifiers:?}");
             }
 
         };

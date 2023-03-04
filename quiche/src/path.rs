@@ -662,73 +662,6 @@ impl ExactSizeIterator for SocketAddrIter {
     }
 }
 
-pub struct PathGroup {
-    paths: HashSet<usize>,
-    advertise_insert_pid: VecDeque<usize>,
-    advertise_remove_pid: VecDeque<usize>,
-}
-
-impl PathGroup {
-    pub fn new() -> Self {
-        Self {
-            paths: HashSet::new(),
-            advertise_insert_pid: VecDeque::new(),
-            advertise_remove_pid: VecDeque::new()
-        }
-    }
-
-    pub fn get(&self) -> Vec<usize> {
-        self.paths
-            .iter()
-            .copied()
-            .collect::<Vec<usize>>()
-    }
-
-    #[inline]
-    pub fn insert(&mut self, pid: usize) -> bool {
-        self.paths.insert(pid)
-    }
-
-    #[inline]
-    pub fn remove(&mut self, pid: usize) -> bool {
-        self.paths.remove(&pid)
-    }
-
-    fn mark_advertise_insert_pid(&mut self, pid: usize, advertise: bool) {
-        if advertise {
-            self.advertise_insert_pid.push_back(pid);
-        } else if let Some(index) = self
-            .advertise_insert_pid
-            .iter()
-            .position(|s| *s == pid)
-        {
-            self.advertise_insert_pid.remove(index);
-        }
-    }
-
-    fn mark_advertise_remove_pid(&mut self, pid: usize, advertise: bool) {
-        if advertise {
-            self.advertise_remove_pid.push_back(pid);
-        } else if let Some(index) = self
-            .advertise_remove_pid
-            .iter()
-            .position(|s| *s == pid)
-        {
-            self.advertise_remove_pid.remove(index);
-        }
-    }
-
-    #[inline]
-    pub fn next_advertise_insert_pid(&self) -> Option<usize> {
-        self.advertise_insert_pid.front().copied()
-    }
-
-    #[inline]
-    pub fn next_advertise_remove_pid(&self) -> Option<usize> {
-        self.advertise_remove_pid.front().copied()
-    }
-}
-
 /// All path-related information.
 pub struct PathMap {
     /// The paths of the connection. Each of them has an internal identifier
@@ -736,7 +669,7 @@ pub struct PathMap {
     paths: Slab<Path>,
 
     /// The groups of the paths
-    groups: Slab<PathGroup>,
+    groups: BTreeMap<u64, HashSet<usize>>,
 
     /// The maximum number of concurrent paths allowed.
     max_concurrent_paths: usize,
@@ -761,6 +694,12 @@ pub struct PathMap {
     path_status_to_advertise: VecDeque<(usize, u64, u64)>,
     /// The sequence number for the next PATH_STATUS.
     next_path_status_seq_num: u64,
+
+    advertise_path_set_group: VecDeque<u64>,
+
+    next_path_set_group_seq_num: u64,
+
+    expected_path_set_group_seq_num: u64,
 }
 
 impl PathMap {
@@ -770,7 +709,7 @@ impl PathMap {
         mut initial_path: Path, max_concurrent_paths: usize, is_server: bool,
     ) -> Self {
         let mut paths = Slab::with_capacity(1); // most connections only have one path
-        let mut groups = Slab::with_capacity(1);
+        let mut groups = BTreeMap::new();
         let mut addrs_to_paths = BTreeMap::new();
 
         let local_addr = initial_path.local_addr;
@@ -781,12 +720,12 @@ impl PathMap {
 
         let active_path_id = paths.insert(initial_path);
 
-        let mut initial_group = PathGroup::new();
-        initial_group.insert(active_path_id);
-        let initial_group_id = groups.insert(initial_group);
-        assert_eq!(initial_group_id, 0);
-
         addrs_to_paths.insert((local_addr, peer_addr), active_path_id);
+
+        let mut initial_group = HashSet::new();
+        initial_group.insert(active_path_id);
+
+        groups.insert(0, initial_group);
 
         Self {
             paths,
@@ -799,6 +738,9 @@ impl PathMap {
             path_abandon: VecDeque::new(),
             path_status_to_advertise: VecDeque::new(),
             next_path_status_seq_num: 0,
+            advertise_path_set_group: VecDeque::new(),
+            next_path_set_group_seq_num: 0,
+            expected_path_set_group_seq_num: 0,
         }
     }
 
@@ -980,10 +922,13 @@ impl PathMap {
     /// [`InvalidState`]: enum.Error.html#variant.InvalidState
     #[inline]
     pub fn get_group_pid(&self, group_id: u64) -> Result<Vec<usize>> {
-        self.groups
-            .get(group_id.try_into().unwrap())
-            .map(|v| v.get())
-            .ok_or(Error::InvalidState)
+        let pids = self.groups
+            .get(&group_id)
+            .ok_or(Error::InvalidState)?
+            .iter()
+            .copied()
+            .collect::<Vec<usize>>();
+        Ok(pids)
     }
 
     /// Records the provided `PathGroup` and returns its assigned identifier.
@@ -997,18 +942,18 @@ impl PathMap {
         let local_addr = path.local_addr;
         let peer_addr = path.peer_addr;
 
-        if !self.groups.contains(group_id.try_into().unwrap()) {
-            self.groups.insert(PathGroup::new());
+        if !self.groups.contains_key(&group_id) {
+            self.groups.insert(group_id, HashSet::new());
         }
 
         let inserted = self.groups
-            .get_mut(group_id.try_into().unwrap())
+            .get_mut(&group_id)
             .unwrap()
             .insert(path_id);
 
         if inserted && group_id > 0 { 
             if !is_server {
-                self.mark_advertise_insert_pid(group_id, path_id, true)?;
+                self.mark_advertise_path_set_group(group_id, true);
             } else {
                 // Notifies the application if we are in server mode.
                 self.notify_event(PathEvent::InsertGroup(group_id, (local_addr, peer_addr)));
@@ -1016,44 +961,6 @@ impl PathMap {
         }
 
         Ok(inserted)
-    }
-
-    pub fn mark_advertise_insert_pid(&mut self, group_id: u64, path_id: usize, advertise: bool) -> Result<()> {
-        self.groups
-            .get_mut(group_id.try_into().unwrap())
-            .and_then(|v| Some(v.mark_advertise_insert_pid(path_id, advertise)))
-            .ok_or(Error::InvalidState)
-    }
-
-    pub fn mark_advertise_remove_pid(&mut self, group_id: u64, path_id: usize, advertise: bool) -> Result<()> {
-        self.groups
-            .get_mut(group_id.try_into().unwrap())
-            .and_then(|v| Some(v.mark_advertise_remove_pid(path_id, advertise)))
-            .ok_or(Error::InvalidState)
-    }
-
-    pub fn next_advertise_insert_pid(&self) -> Option<(u64, usize)> {
-        self.groups
-            .iter()
-            .filter_map(|(gid, v)| {
-                v.next_advertise_insert_pid()
-                    .map(|pid| {
-                        (gid.try_into().unwrap(), pid)
-                    })
-            })
-            .next()
-    }
-
-    pub fn next_advertise_remove_pid(&self) -> Option<(u64, usize)> {
-        self.groups
-            .iter()
-            .filter_map(|(gid, v)| {
-                v.next_advertise_remove_pid()
-                    .map(|pid| {
-                        (gid.try_into().unwrap(), pid)
-                    })
-            })
-            .next()
     }
     
     /// Notifies a path event to the application served by the connection.
@@ -1127,6 +1034,7 @@ impl PathMap {
         }
         Ok(())
     }
+
     /// Handles incoming PATH_RESPONSE data.
     pub fn on_response_received(&mut self, data: [u8; 8]) -> Result<()> {
         let active_pid = self.get_active_path_id()?;
@@ -1358,6 +1266,31 @@ impl PathMap {
             }
         }
     }
+
+    /// Adds or remove the path ID from the set of paths requiring sending a
+    /// PATH_ABANDON frame.
+    pub fn mark_advertise_path_set_group(&mut self, group_id: u64, advertise: bool) {
+        if advertise {
+            self.advertise_path_set_group.push_back(group_id);
+        } else {
+            self.advertise_path_set_group.retain(|g| *g != group_id);
+        }
+    }
+
+    /// Returns the Path ID that should be advertised in the next PATH_ABANDON
+    /// frame.
+    pub fn next_advertise_path_set_group(&mut self) -> Option<(u64, u64)> {
+        self.advertise_path_set_group
+            .front()
+            .copied()
+            .map(|gid| {
+                let seq_num = self.next_path_set_group_seq_num;
+                self.next_path_set_group_seq_num += 1;
+                (gid, seq_num)
+            })
+    }
+
+
 }
 
 /// Statistics about the path of a connection.

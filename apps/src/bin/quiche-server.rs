@@ -796,7 +796,7 @@ fn handle_path_events(client: &mut Client) {
             quiche::PathEvent::ReturnAvailable(..) => {},
 
             quiche::PathEvent::InsertGroup(group_id, addr) => {
-                info!("Peer inserts {:?} into {} group", addr, group_id);
+                info!("Peer inserts path {:?} into group {}", addr, group_id);
             },
 
             quiche::PathEvent::RemoveGroup(..) => {},

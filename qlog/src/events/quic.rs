@@ -526,14 +526,10 @@ pub enum QuicFrame {
         status: u64,
     },
 
-    PathInsertGroup {
+    PathSetGroup {
         group_identifier: u64,
-        path_identifier: u64,
-    },
-
-    PathRemoveGroup {
-        group_identifier: u64,
-        path_identifier: u64,
+        seq_num: u64,
+        path_identifiers: Vec<u64>,
     },
 
     Unknown {
