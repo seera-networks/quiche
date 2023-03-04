@@ -965,7 +965,7 @@ impl PathMap {
         }
 
         if self.insert_group(0, pid, is_server)? {
-            warn!("Newly inserted path already exists!");
+            warn!("Newly inserted path {pid} already exists!");
         }
 
         Ok(pid)
@@ -1004,11 +1004,9 @@ impl PathMap {
             .unwrap()
             .insert(path_id);
 
-        if inserted { 
+        if inserted && group_id > 0 { 
             if !is_server {
-                if group_id > 0 {
-                    self.mark_advertise_insert_pid(group_id, path_id, true)?;
-                }
+                self.mark_advertise_insert_pid(group_id, path_id, true)?;
             } else {
                 // Notifies the application if we are in server mode.
                 self.notify_event(PathEvent::InsertGroup(group_id, (local_addr, peer_addr)));
