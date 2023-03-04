@@ -1323,10 +1323,12 @@ impl PathMap {
             let new_path_ids = HashSet::from_iter(path_ids.into_iter());
 
             for pid in new_path_ids.difference(&old_path_ids) {
+                println!("Add {}", *pid);
                 self.insert_group(group_id, *pid, true)?;
             }
 
             for pid in old_path_ids.difference(&new_path_ids) {
+                println!("Delete {}", *pid);
                 self.remove_group(group_id, *pid, true)?;
             }
         }
