@@ -7333,7 +7333,19 @@ impl Connection {
                 seq_num,
                 path_identifiers,
             } => {
-                println!("PathSetGroup: gid={group_identifier}, seq_num={seq_num}, pids={path_identifiers:?}");
+                if !self.is_server {
+                    return Err(Error::MultiPathViolation);
+                }
+                let pids = path_identifiers.iter()
+                    .map(|scid_seq_num| {
+                        self.ids
+                            .get_scid(*scid_seq_num)
+                            .and_then(|e| {
+                                e.path_id.ok_or(Error::InvalidState)
+                            })
+                    })
+                    .collect::<Result<Vec<usize>>>()?;
+                self.paths.on_path_set_group_received(group_identifier, seq_num, pids)?;
             }
 
         };

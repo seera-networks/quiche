@@ -25,6 +25,7 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::convert::TryInto;
+use std::iter::FromIterator;
 use std::time;
 
 use std::collections::BTreeMap;
@@ -948,7 +949,7 @@ impl PathMap {
 
         let inserted = self.groups
             .get_mut(&group_id)
-            .unwrap()
+            .ok_or(Error::InvalidState)?
             .insert(path_id);
 
         if inserted && group_id > 0 { 
@@ -959,10 +960,30 @@ impl PathMap {
                 self.notify_event(PathEvent::InsertGroup(group_id, (local_addr, peer_addr)));
             }
         }
-
         Ok(inserted)
     }
-    
+
+    pub fn remove_group(&mut self, group_id: u64, path_id: usize, is_server: bool) -> Result<bool> {
+        let path = self.get(path_id)?;
+        let local_addr = path.local_addr;
+        let peer_addr = path.peer_addr;
+
+        let removed = self.groups
+            .get_mut(&group_id)
+            .ok_or(Error::InvalidState)?
+            .remove(&path_id);
+
+        if removed && group_id > 0 { 
+            if !is_server {
+                self.mark_advertise_path_set_group(group_id, true);
+            } else {
+                // Notifies the application if we are in server mode.
+                self.notify_event(PathEvent::RemoveGroup(group_id, (local_addr, peer_addr)));
+            }
+        }
+        Ok(removed)
+    }
+
     /// Notifies a path event to the application served by the connection.
     pub fn notify_event(&mut self, ev: PathEvent) {
         self.events.push_back(ev);
@@ -1289,6 +1310,29 @@ impl PathMap {
                 (gid, seq_num)
             })
     }
+
+    pub fn on_path_set_group_received(&mut self, group_id: u64, seq_num: u64, path_ids: Vec<usize>) -> Result<()> {
+        if seq_num >= self.expected_path_set_group_seq_num {
+            self.expected_path_set_group_seq_num = seq_num.saturating_add(1);
+
+            let old_path_ids = self.groups
+                .get(&group_id)
+                .unwrap_or(&HashSet::new())
+                .clone();
+
+            let new_path_ids = HashSet::from_iter(path_ids.into_iter());
+
+            for pid in new_path_ids.difference(&old_path_ids) {
+                self.insert_group(group_id, *pid, true)?;
+            }
+
+            for pid in old_path_ids.difference(&new_path_ids) {
+                self.remove_group(group_id, *pid, true)?;
+            }
+        }
+        Ok(())
+    }
+
 
 
 }
