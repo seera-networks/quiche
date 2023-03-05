@@ -280,6 +280,8 @@ pub struct Path {
 
     /// The expected sequence number of the PATH_STATUS to be received.
     expected_path_status_seq_num: u64,
+
+    group: HashSet<u64>,
 }
 
 impl Path {
@@ -325,6 +327,7 @@ impl Path {
             migrating: false,
             needs_ack_eliciting: false,
             expected_path_status_seq_num: 0,
+            group: HashSet::new(),
         }
     }
 
@@ -537,6 +540,18 @@ impl Path {
         Ok(())
     }
 
+    fn insert_group(&mut self, group_id: u64) -> bool {
+        self.group.insert(group_id)
+    }
+
+    fn remove_group(&mut self, group_id: u64) -> bool {
+        self.group.remove(&group_id)
+    }
+
+    pub fn group(&self) -> Vec<u64> {
+        self.group.iter().copied().collect::<Vec<_>>()
+    }
+
     #[inline]
     pub fn pop_received_challenge(&mut self) -> Option<[u8; 8]> {
         self.received_challenges.pop_front()
@@ -718,6 +733,8 @@ impl PathMap {
 
         // As it is the first path, it is active by default.
         initial_path.state = PathState::Active;
+
+        initial_path.insert_group(0);
 
         let active_path_id = paths.insert(initial_path);
 
@@ -916,6 +933,14 @@ impl PathMap {
         Ok(pid)
     }
 
+    #[inline]
+    pub fn get_group_ids(&self) -> Vec<u64> {
+        self.groups
+            .iter()
+            .map(|(gid, _)| *gid)
+            .collect::<Vec<_>>()
+    }
+
     /// Gets an immutable reference to the group identified by `group_id`. If the
     /// provided `group_id` does not identify any current `PathGroup`, returns an
     /// [`InvalidState`].
@@ -939,9 +964,11 @@ impl PathMap {
     ///
     /// [`Done`]: enum.Error.html#variant.Done
     pub fn insert_group(&mut self, group_id: u64, path_id: usize, is_server: bool) -> Result<bool> {
-        let path = self.get(path_id)?;
+        let path = self.get_mut(path_id)?;
         let local_addr = path.local_addr;
         let peer_addr = path.peer_addr;
+
+        path.insert_group(group_id);
 
         if !self.groups.contains_key(&group_id) {
             self.groups.insert(group_id, HashSet::new());
@@ -964,9 +991,11 @@ impl PathMap {
     }
 
     pub fn remove_group(&mut self, group_id: u64, path_id: usize, is_server: bool) -> Result<bool> {
-        let path = self.get(path_id)?;
+        let path = self.get_mut(path_id)?;
         let local_addr = path.local_addr;
         let peer_addr = path.peer_addr;
+
+        path.remove_group(group_id);
 
         let removed = self.groups
             .get_mut(&group_id)

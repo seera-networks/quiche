@@ -3268,7 +3268,7 @@ impl Connection {
                                 stream_id,
                                 urgency,
                                 incremental,
-                            );
+                            )?;
                         }
 
                         self.stream_retrans_bytes += length as u64;
@@ -4184,7 +4184,8 @@ impl Connection {
             !dgram_emitted &&
             (consider_standby_paths || !path.is_standby())
         {
-            while let Some(stream_id) = self.streams.peek_flushable() {
+            println!("send_pid: {send_pid}, group: {:?}", path.group());
+            while let Some((stream_id, group_id)) = self.streams.peek_flushable(path.group()) {
                 let stream = match self.streams.get_mut(stream_id) {
                     // Avoid sending frames for streams that were already stopped.
                     //
@@ -4192,7 +4193,7 @@ impl Connection {
                     // flushed on the wire when a STOP_SENDING frame is received.
                     Some(v) if !v.send.is_stopped() => v,
                     _ => {
-                        self.streams.remove_flushable();
+                        self.streams.remove_flushable(group_id);
                         continue;
                     },
                 };
@@ -4221,7 +4222,7 @@ impl Connection {
                 let max_len = match left.checked_sub(hdr_len) {
                     Some(v) => v,
                     None => {
-                        self.streams.remove_flushable();
+                        self.streams.remove_flushable(group_id);
                         continue;
                     },
                 };
@@ -4267,7 +4268,7 @@ impl Connection {
 
                 // If the stream is no longer flushable, remove it from the queue
                 if !stream.is_flushable() {
-                    self.streams.remove_flushable();
+                    self.streams.remove_flushable(group_id);
                 }
 
                 break;
@@ -4782,7 +4783,7 @@ impl Connection {
         // Consider the stream flushable also when we are sending a zero-length
         // frame that has the fin flag set.
         if (flushable || empty_fin) && !was_flushable {
-            self.streams.push_flushable(stream_id, urgency, incremental);
+            self.streams.push_flushable(stream_id, urgency, incremental)?;
         }
 
         if !writable {
@@ -4812,6 +4813,22 @@ impl Connection {
         }
 
         Ok(sent)
+    }
+
+    /// Sets the group for a stream.
+    pub fn stream_group(
+        &mut self, stream_id: u64, group_id: u64,
+    ) -> Result<()> {
+        // Get existing stream or create a new one
+        let stream = match self.get_or_create_stream(stream_id, true) {
+            Ok(v) => v,
+
+            Err(e) => return Err(e),
+        };
+
+        stream.group_id = group_id;
+
+        Ok(())
     }
 
     /// Sets the priority for a stream.
@@ -7644,11 +7661,18 @@ impl Connection {
         // is open. This should only be used when data need to be sent.
         // If we have standby paths, we may run the loop a second time.
         if self.paths.multipath() && (dgrams_to_emit || stream_to_emit) {
+            let group_id = self.streams.get_group_highest_urgency().expect("not flushable");
+            let path_ids = self.paths.get_group(group_id)?;
+            println!("group_id: {group_id}, path_ids: {:?}", path_ids);
             // We loop at most twice.
             loop {
-                if let Some(pid) = self
-                    .paths
+                if let Some(pid) = path_ids
                     .iter()
+                    .filter_map(|pid| {
+                        self.paths.get(*pid)
+                            .ok()
+                            .map(|p| (*pid, p))
+                    })
                     .filter(|(_, p)| {
                         // Follow the filter provided as parameters.
                         let local = from.map(|f| f == p.local_addr()).unwrap_or(true);
@@ -7660,6 +7684,7 @@ impl Connection {
                     .min_by_key(|(_, p)| p.recovery.rtt())
                     .map(|(pid, _)| pid)
                 {
+                    println!("pid: {pid}");
                     return Ok(pid);
                 }
                 if consider_standby || !self.paths.consider_standby_paths() {
@@ -16567,6 +16592,25 @@ mod tests {
         assert_eq!(path_c2s_1.active(), false);
         assert_eq!(path_s2c_0.active(), true);
         assert_eq!(path_s2c_1.active(), false);
+
+        assert_eq!(
+            pipe.client.set_active(client_addr_2, server_addr, true,),
+            Ok(())
+        );
+        assert_eq!(
+            pipe.server.set_active(server_addr, client_addr_2, true,),
+            Ok(())
+        );
+
+        assert_eq!(pipe.client.stream_group(0, 1), Ok(()));
+        assert_eq!(pipe.client.stream_priority(0, 127, true), Ok(()));
+        assert_eq!(pipe.client.stream_group(4, 0), Ok(()));
+        assert_eq!(pipe.client.stream_priority(4, 255, true), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
+        assert_eq!(pipe.client.stream_send(4, b"a", false), Ok(1));
+
+        assert_eq!(pipe.advance(), Ok(()));
 
     }
 

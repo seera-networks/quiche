@@ -26,6 +26,7 @@
 
 use std::cmp;
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use std::collections::hash_map;
@@ -142,7 +143,7 @@ pub struct StreamMap {
     /// same urgency level Non-incremental streams are scheduled first, in the
     /// order of their stream IDs, and incremental streams are scheduled in a
     /// round-robin fashion after all non-incremental streams have been flushed.
-    flushable: BTreeMap<u8, (BinaryHeap<std::cmp::Reverse<u64>>, VecDeque<u64>)>,
+    flushable: BTreeMap<u64, BTreeMap<u8, (BinaryHeap<std::cmp::Reverse<u64>>, VecDeque<u64>)>>,
 
     /// Set of stream IDs corresponding to streams that have outstanding data
     /// to read. This is used to generate a `StreamIter` of streams without
@@ -321,6 +322,7 @@ impl StreamMap {
                     is_bidi(id),
                     local,
                     self.max_stream_window,
+                    0,
                 );
                 v.insert(s)
             },
@@ -345,11 +347,15 @@ impl StreamMap {
     /// Queueing a stream multiple times simultaneously means that it might be
     /// unfairly scheduled more often than other streams, and might also cause
     /// spurious cycles through the queue, so it should be avoided.
-    pub fn push_flushable(&mut self, stream_id: u64, urgency: u8, incr: bool) {
+    pub fn push_flushable(&mut self, stream_id: u64, urgency: u8, incr: bool) -> Result<()> {
+        let stream = self.get(stream_id).ok_or(Error::InvalidState)?;
+
         // Push the element to the back of the queue corresponding to the given
         // urgency. If the queue doesn't exist yet, create it first.
         let queues = self
             .flushable
+            .entry(stream.group_id)
+            .or_insert_with(|| BTreeMap::new())
             .entry(urgency)
             .or_insert_with(|| (BinaryHeap::new(), VecDeque::new()));
 
@@ -360,6 +366,43 @@ impl StreamMap {
             // Incremental streams are scheduled in a round-robin fashion.
             queues.1.push_back(stream_id)
         };
+        Ok(())
+    }
+
+    pub fn get_group_highest_urgency(&self) -> Option<u64> {
+        self.flushable
+            .iter()
+            .filter_map(|(gid, e)| {
+                e.iter()
+                    .next()
+                    .and_then(|(urgency, queues)| {
+                        queues.0.peek()
+                            .map(|x| {
+                                (*gid, *urgency, false, x.0)
+                            })
+                            .or_else(|| {
+                                queues.1.front()
+                                    .map(|x| {
+                                        (*gid, *urgency, true, *x)
+                                    })
+                            })
+                    })
+            })
+            .min_by(|x, y| {
+                let odering = x.1.cmp(&y.1);
+                if odering == Ordering::Equal {
+                    if !x.2 && y.2 {
+                        Ordering::Less
+                    } else if x.2 && !y.2 {
+                        Ordering::Greater
+                    } else {
+                        x.3.cmp(&y.3)
+                    }
+                } else {
+                    odering
+                }
+            })
+            .map(|(gid, _, _, _)| gid)
     }
 
     /// Returns the first stream ID from the flushable streams
@@ -367,26 +410,66 @@ impl StreamMap {
     ///
     /// Note that if the stream is no longer flushable after sending some of its
     /// outstanding data, it needs to be removed from the queue.
-    pub fn peek_flushable(&mut self) -> Option<u64> {
-        self.flushable.iter_mut().next().and_then(|(_, queues)| {
-            queues.0.peek().map(|x| x.0).or_else(|| {
-                // When peeking incremental streams, make sure to move the current
-                // stream to the end of the queue so they are pocesses in a round
-                // robin fashion
-                if let Some(current_incremental) = queues.1.pop_front() {
-                    queues.1.push_back(current_incremental);
-                    Some(current_incremental)
+    pub fn peek_flushable(&mut self, group_ids: Vec<u64>) -> Option<(u64, u64)> {
+        if let Some((gid, urgency, incremental, sid)) = group_ids.iter()
+            .filter_map(|gid| {
+                self.flushable
+                    .get(gid)
+                    .and_then(|e| {
+                        e.iter()
+                            .next()
+                            .and_then(|(urgency, queues)| {
+                                queues.0.peek()
+                                    .map(|x| {
+                                        (*gid, *urgency, false, x.0)
+                                    })
+                                    .or_else(|| {
+                                        queues.1.front()
+                                            .map(|x| {
+                                                (*gid, *urgency, true, *x)
+                                            })
+                                    })
+                            })
+                    })
+            })
+            .min_by(|x, y| {
+                let odering = x.1.cmp(&y.1);
+                if odering == Ordering::Equal {
+                    if !x.2 && y.2 {
+                        Ordering::Less
+                    } else if x.2 && !y.2 {
+                        Ordering::Greater
+                    } else {
+                        x.3.cmp(&y.3)
+                    }
                 } else {
-                    None
+                    odering
                 }
             })
-        })
+        {
+            println!("gid: {gid}, urgency: {urgency}, incremental: {incremental}, sid: {sid}");
+            if incremental {
+                let queues = self.flushable
+                    .get_mut(&gid)
+                    .expect("Invalid gid")
+                    .get_mut(&urgency)
+                    .expect("Invalid urgency");
+                let current_incremental = queues.1.pop_front().expect("Invalid incremental");
+                queues.1.push_back(current_incremental);
+            }
+            Some((sid, gid))
+        } else {
+            None
+        }
     }
 
     /// Remove the last peeked stream
-    pub fn remove_flushable(&mut self) {
+    pub fn remove_flushable(&mut self, group_id: u64) {
+        println!("group_id: {group_id}");
         let mut top_urgency = self
             .flushable
+            .get_mut(&group_id)
+            .expect("Invalid gid")
             .first_entry()
             .expect("Remove previously peeked stream");
 
@@ -584,7 +667,13 @@ impl StreamMap {
 
     /// Returns true if there are any streams that have data to write.
     pub fn has_flushable(&self) -> bool {
-        !self.flushable.is_empty()
+        self.flushable
+            .iter()
+            .filter_map(|(_, e)| {
+                e.iter().next()
+            })
+            .next()
+            .is_some()
     }
 
     /// Returns true if there are any streams that have data to read.
@@ -659,13 +748,15 @@ pub struct Stream {
 
     /// Whether the stream can be flushed incrementally. Default is `true`.
     pub incremental: bool,
+
+    pub group_id: u64,
 }
 
 impl Stream {
     /// Creates a new stream with the given flow control limits.
     pub fn new(
         max_rx_data: u64, max_tx_data: u64, bidi: bool, local: bool,
-        max_window: u64,
+        max_window: u64, group_id: u64,
     ) -> Stream {
         Stream {
             recv: RecvBuf::new(max_rx_data, max_window),
@@ -675,6 +766,7 @@ impl Stream {
             data: None,
             urgency: DEFAULT_URGENCY,
             incremental: true,
+            group_id,
         }
     }
 
@@ -2500,7 +2592,7 @@ mod tests {
 
     #[test]
     fn recv_flow_control() {
-        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW, 0);
         assert!(!stream.recv.almost_full());
 
         let mut buf = [0; 32];
@@ -2531,7 +2623,7 @@ mod tests {
 
     #[test]
     fn recv_past_fin() {
-        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW, 0);
         assert!(!stream.recv.almost_full());
 
         let first = RangeBuf::from(b"hello", 0, true);
@@ -2543,7 +2635,7 @@ mod tests {
 
     #[test]
     fn recv_fin_dup() {
-        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW, 0);
         assert!(!stream.recv.almost_full());
 
         let first = RangeBuf::from(b"hello", 0, true);
@@ -2561,7 +2653,7 @@ mod tests {
 
     #[test]
     fn recv_fin_change() {
-        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW, 0);
         assert!(!stream.recv.almost_full());
 
         let first = RangeBuf::from(b"hello", 0, true);
@@ -2573,7 +2665,7 @@ mod tests {
 
     #[test]
     fn recv_fin_lower_than_received() {
-        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW, 0);
         assert!(!stream.recv.almost_full());
 
         let first = RangeBuf::from(b"hello", 0, true);
@@ -2585,7 +2677,7 @@ mod tests {
 
     #[test]
     fn recv_fin_flow_control() {
-        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW, 0);
         assert!(!stream.recv.almost_full());
 
         let mut buf = [0; 32];
@@ -2605,7 +2697,7 @@ mod tests {
 
     #[test]
     fn recv_fin_reset_mismatch() {
-        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW, 0);
         assert!(!stream.recv.almost_full());
 
         let first = RangeBuf::from(b"hello", 0, true);
@@ -2616,7 +2708,7 @@ mod tests {
 
     #[test]
     fn recv_reset_dup() {
-        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW, 0);
         assert!(!stream.recv.almost_full());
 
         let first = RangeBuf::from(b"hello", 0, false);
@@ -2628,7 +2720,7 @@ mod tests {
 
     #[test]
     fn recv_reset_change() {
-        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW, 0);
         assert!(!stream.recv.almost_full());
 
         let first = RangeBuf::from(b"hello", 0, false);
@@ -2640,7 +2732,7 @@ mod tests {
 
     #[test]
     fn recv_reset_lower_than_received() {
-        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW, 0);
         assert!(!stream.recv.almost_full());
 
         let first = RangeBuf::from(b"hello", 0, false);
@@ -2653,7 +2745,7 @@ mod tests {
     fn send_flow_control() {
         let mut buf = [0; 25];
 
-        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW, 0);
 
         let first = b"hello";
         let second = b"world";
@@ -2696,7 +2788,7 @@ mod tests {
 
     #[test]
     fn send_past_fin() {
-        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW, 0);
 
         let first = b"hello";
         let second = b"world";
@@ -2712,7 +2804,7 @@ mod tests {
 
     #[test]
     fn send_fin_dup() {
-        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW, 0);
 
         assert_eq!(stream.send.write(b"hello", true), Ok(5));
         assert!(stream.send.is_fin());
@@ -2723,7 +2815,7 @@ mod tests {
 
     #[test]
     fn send_undo_fin() {
-        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW, 0);
 
         assert_eq!(stream.send.write(b"hello", true), Ok(5));
         assert!(stream.send.is_fin());
@@ -2738,7 +2830,7 @@ mod tests {
     fn send_fin_max_data_match() {
         let mut buf = [0; 15];
 
-        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW, 0);
 
         let slice = b"hellohellohello";
 
@@ -2754,7 +2846,7 @@ mod tests {
     fn send_fin_zero_length() {
         let mut buf = [0; 5];
 
-        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW, 0);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.write(b"", true), Ok(0));
@@ -2770,7 +2862,7 @@ mod tests {
     fn send_ack() {
         let mut buf = [0; 5];
 
-        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW, 0);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.write(b"world", false), Ok(5));
@@ -2800,7 +2892,7 @@ mod tests {
     fn send_ack_reordering() {
         let mut buf = [0; 5];
 
-        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW, 0);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.write(b"world", false), Ok(5));
@@ -2837,7 +2929,7 @@ mod tests {
 
     #[test]
     fn recv_data_below_off() {
-        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW, 0);
 
         let first = RangeBuf::from(b"hello", 0, false);
 
@@ -2859,7 +2951,7 @@ mod tests {
 
     #[test]
     fn stream_complete() {
-        let mut stream = Stream::new(30, 30, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(30, 30, true, true, DEFAULT_STREAM_WINDOW, 0);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.write(b"world", false), Ok(5));
@@ -2902,7 +2994,7 @@ mod tests {
     fn send_fin_zero_length_output() {
         let mut buf = [0; 5];
 
-        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW, 0);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.off_front(), 0);
@@ -2927,7 +3019,7 @@ mod tests {
     fn send_emit() {
         let mut buf = [0; 5];
 
-        let mut stream = Stream::new(0, 20, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(0, 20, true, true, DEFAULT_STREAM_WINDOW, 0);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.write(b"world", false), Ok(5));
@@ -2979,7 +3071,7 @@ mod tests {
     fn send_emit_ack() {
         let mut buf = [0; 5];
 
-        let mut stream = Stream::new(0, 20, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(0, 20, true, true, DEFAULT_STREAM_WINDOW, 0);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.write(b"world", false), Ok(5));
@@ -3046,7 +3138,7 @@ mod tests {
     fn send_emit_retransmit() {
         let mut buf = [0; 5];
 
-        let mut stream = Stream::new(0, 20, true, true, DEFAULT_STREAM_WINDOW);
+        let mut stream = Stream::new(0, 20, true, true, DEFAULT_STREAM_WINDOW, 0);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.write(b"world", false), Ok(5));

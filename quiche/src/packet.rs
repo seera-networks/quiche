@@ -938,6 +938,7 @@ impl PktNumSpaceCrypto {
                 true,
                 true,
                 stream::MAX_STREAM_WINDOW,
+                0,
             ),
         }
     }
@@ -949,6 +950,7 @@ impl PktNumSpaceCrypto {
             true,
             true,
             stream::MAX_STREAM_WINDOW,
+            0,
         );
     }
 
