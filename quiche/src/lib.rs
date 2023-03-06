@@ -6440,6 +6440,19 @@ impl Connection {
         self.paths.iter().map(|(_, p)| p.stats())
     }
 
+    pub fn path_flushable_stats(&self) -> impl Iterator<Item = PathStats> + '_ {
+        let group_id = self.streams.get_group_highest_urgency();
+        self.paths
+            .iter()
+            .filter_map(move |(_, p)| {
+                if group_id.is_some() && p.group().contains(&group_id.unwrap()) {
+                    Some(p.stats())
+                } else {
+                    None
+            }
+            })
+}
+
     fn encode_transport_params(&mut self) -> Result<()> {
         let mut raw_params = [0; 128];
 

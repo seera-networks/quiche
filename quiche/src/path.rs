@@ -957,6 +957,16 @@ impl PathMap {
         Ok(pids)
     }
 
+    #[inline]
+    pub fn get_group2(&self, group_id: u64) -> Result<impl Iterator<Item = usize> + '_> {
+        let iter = self.groups
+            .get(&group_id)
+            .ok_or(Error::InvalidState)?
+            .iter()
+            .copied();
+        Ok(iter)
+    }
+
     /// Records the provided `PathGroup` and returns its assigned identifier.
     ///
     /// On success, this method takes care of creating a notification to the
