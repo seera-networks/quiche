@@ -4820,6 +4820,20 @@ impl Connection {
     pub fn stream_group(
         &mut self, stream_id: u64, group_id: u64,
     ) -> Result<()> {
+        if !self.paths
+            .get_group2(group_id)?
+            .filter_map(|pid| {
+                self.paths
+                    .get(pid)
+                    .ok()
+            })
+            .any(|p| {
+                p.usable()
+            })
+        {
+            // No usable path
+            return Err(Error::InvalidState);
+        }
         // Get existing stream or create a new one
         let stream = match self.get_or_create_stream(stream_id, true) {
             Ok(v) => v,
