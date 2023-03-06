@@ -4742,7 +4742,6 @@ impl Connection {
         // Get existing stream or create a new one.
         let stream = self.get_or_create_stream(stream_id, true)?;
 
-        println!("stream_send: group_is={}", stream.group_id);
         #[cfg(feature = "qlog")]
         let offset = stream.send.off_back();
 
@@ -4842,7 +4841,6 @@ impl Connection {
         };
 
         stream.group_id = group_id;
-        println!("stream_group: group_id={}", stream.group_id);
 
         Ok(())
     }
@@ -5425,6 +5423,10 @@ impl Connection {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn dgram_send(&mut self, buf: &[u8]) -> Result<()> {
+        self.dgram_send_group(buf, 0)
+    }
+
+    pub fn dgram_send_group(&mut self, buf: &[u8], group_id: u64) -> Result<()> {
         let max_payload_len = match self.dgram_max_writable_len() {
             Some(v) => v,
 
@@ -5435,7 +5437,7 @@ impl Connection {
             return Err(Error::BufferTooShort);
         }
 
-        self.dgram_send_queue.push(buf.to_vec(), 0)?;
+        self.dgram_send_queue.push(buf.to_vec(), group_id)?;
 
         let active_path = self.paths.get_active_mut()?;
 
@@ -5455,6 +5457,10 @@ impl Connection {
     ///
     /// [`dgram_send()`]: struct.Connection.html#method.dgram_send
     pub fn dgram_send_vec(&mut self, buf: Vec<u8>) -> Result<()> {
+        self.dgram_send_vec_group(buf, 0)
+    }
+
+    pub fn dgram_send_vec_group(&mut self, buf: Vec<u8>, group_id: u64) -> Result<()> {
         let max_payload_len = match self.dgram_max_writable_len() {
             Some(v) => v,
 
@@ -5465,7 +5471,7 @@ impl Connection {
             return Err(Error::BufferTooShort);
         }
 
-        self.dgram_send_queue.push(buf, 0)?;
+        self.dgram_send_queue.push(buf, group_id)?;
 
         let active_path = self.paths.get_active_mut()?;
 
@@ -5917,7 +5923,6 @@ impl Connection {
 
     pub fn insert_group(&mut self, local: SocketAddr, peer: SocketAddr, group_id: u64) -> Result<bool> {
         if let Some(path_id) = self.paths.path_id_from_addrs(&(local, peer)) {
-            println!("insert_group: path_id={path_id}, local={local:?}, peer={peer:?}, group_id={group_id}");
             let path = self.paths.get(path_id)?;
             if path.active_scid_seq.is_some() {
                 return self.paths.insert_group(group_id, path_id, self.is_server);
@@ -7693,7 +7698,11 @@ impl Connection {
         // is open. This should only be used when data need to be sent.
         // If we have standby paths, we may run the loop a second time.
         if self.paths.multipath() && (dgrams_to_emit || stream_to_emit) {
-            let group_id = self.streams.get_group_highest_urgency().expect("not flushable");
+            let group_id = if (self.emit_dgram || !stream_to_emit) && dgrams_to_emit {
+                self.dgram_send_queue.get_group_pending().expect("pending")
+            } else {
+                self.streams.get_group_highest_urgency().expect("not flushable")
+            };
             let path_ids = self.paths.get_group(group_id)?;
             println!("group_id: {group_id}, path_ids: {:?}", path_ids);
             // We loop at most twice.
@@ -16675,7 +16684,30 @@ mod tests {
         assert_eq!(flight[0].1.to, client_addr);
         assert_eq!(flight[1].1.to, client_addr_2);
 
+        assert_eq!(testing::process_flight(&mut pipe.client, flight), Ok(()));
+
+        assert_eq!(pipe.client.dgram_send_group(b"a", 1), Ok(()));
+        assert_eq!(pipe.client.dgram_send_group(b"a", 2), Ok(()));
+        let flight = testing::emit_flight(&mut pipe.client).unwrap();
+
+        assert_eq!(flight.len(), 2);
+        assert_eq!(flight[0].1.from, client_addr);
+        assert_eq!(flight[1].1.from, client_addr_2);
+
         assert_eq!(testing::process_flight(&mut pipe.server, flight), Ok(()));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        assert_eq!(pipe.server.dgram_send_group(b"a", 1), Ok(()));
+        assert_eq!(pipe.server.dgram_send_group(b"a", 2), Ok(()));
+        let flight = testing::emit_flight(&mut pipe.server).unwrap();
+
+        assert_eq!(flight.len(), 2);
+        assert_eq!(flight[0].1.to, client_addr);
+        assert_eq!(flight[1].1.to, client_addr_2);
+
+        assert_eq!(testing::process_flight(&mut pipe.client, flight), Ok(()));
+        assert_eq!(pipe.advance(), Ok(()));
+
     }
 
     #[test]

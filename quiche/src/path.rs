@@ -1341,7 +1341,6 @@ impl PathMap {
     /// Returns the Path ID that should be advertised in the next PATH_ABANDON
     /// frame.
     pub fn next_advertise_path_set_group(&mut self) -> Option<(u64, u64)> {
-        println!("next_advertise_path_set_group");
         self.advertise_path_set_group
             .front()
             .copied()

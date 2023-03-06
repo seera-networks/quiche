@@ -133,6 +133,17 @@ impl DatagramQueue {
             .unwrap_or(false)
     }
 
+    pub fn get_group_pending(&self) -> Result<u64> {
+        self.queue
+            .as_ref()
+            .and_then(|map| {
+                map.iter()
+                    .find(|(_, q)| !q.is_empty())
+            })
+            .map(|(group_id, _)| *group_id)
+            .ok_or(Error::InvalidState)
+    }
+
     pub fn purge<F: Fn(&[u8]) -> bool>(&mut self, f: F) {
         let mut queue_bytes_size = 0;
         self.queue
