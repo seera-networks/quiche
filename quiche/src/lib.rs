@@ -4828,6 +4828,7 @@ impl Connection {
         };
 
         stream.group_id = group_id;
+        println!("stream_group: group_id={}", stream.group_id);
 
         Ok(())
     }
