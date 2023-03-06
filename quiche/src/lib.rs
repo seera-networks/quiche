@@ -4106,14 +4106,14 @@ impl Connection {
             do_dgram
         {
             if let Some(max_dgram_payload) = max_dgram_len {
-                while let Some(len) = self.dgram_send_queue.peek_front_len() {
+                while let Some((group_id, len)) = self.dgram_send_queue.peek_front_len(path.group()) {
                     let hdr_off = b.off();
                     let hdr_len = 1 + // frame type
                         2; // length, always encode as 2-byte varint
 
                     if (hdr_len + len) <= left {
                         // Front of the queue fits this packet, send it.
-                        match self.dgram_send_queue.pop() {
+                        match self.dgram_send_queue.pop(group_id) {
                             Some(data) => {
                                 // Encode the frame.
                                 //
@@ -4168,7 +4168,7 @@ impl Connection {
                         };
                     } else if len > max_dgram_payload {
                         // This dgram frame will never fit. Let's purge it.
-                        self.dgram_send_queue.pop();
+                        self.dgram_send_queue.pop(group_id);
                     } else {
                         break;
                     }
@@ -5301,7 +5301,7 @@ impl Connection {
     /// ```
     #[inline]
     pub fn dgram_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
-        match self.dgram_recv_queue.pop() {
+        match self.dgram_recv_queue.pop(0) {
             Some(d) => {
                 if d.len() > buf.len() {
                     return Err(Error::BufferTooShort);
@@ -5323,7 +5323,7 @@ impl Connection {
     /// [`dgram_recv()`]: struct.Connection.html#method.dgram_recv
     #[inline]
     pub fn dgram_recv_vec(&mut self) -> Result<Vec<u8>> {
-        match self.dgram_recv_queue.pop() {
+        match self.dgram_recv_queue.pop(0) {
             Some(d) => Ok(d),
 
             None => Err(Error::Done),
@@ -5345,13 +5345,15 @@ impl Connection {
     /// [`BufferTooShort`]: enum.Error.html#variant.BufferTooShort
     #[inline]
     pub fn dgram_recv_peek(&self, buf: &mut [u8], len: usize) -> Result<usize> {
-        self.dgram_recv_queue.peek_front_bytes(buf, len)
+        let (_, len) = self.dgram_recv_queue.peek_front_bytes(buf, len, vec![0])?;
+        Ok(len)
     }
 
     /// Returns the length of the first stored DATAGRAM.
     #[inline]
     pub fn dgram_recv_front_len(&self) -> Option<usize> {
-        self.dgram_recv_queue.peek_front_len()
+        let (_, len) = self.dgram_recv_queue.peek_front_len(vec![0])?;
+        Some(len)
     }
 
     /// Returns the number of items in the DATAGRAM receive queue.
@@ -5433,7 +5435,7 @@ impl Connection {
             return Err(Error::BufferTooShort);
         }
 
-        self.dgram_send_queue.push(buf.to_vec())?;
+        self.dgram_send_queue.push(buf.to_vec(), 0)?;
 
         let active_path = self.paths.get_active_mut()?;
 
@@ -5463,7 +5465,7 @@ impl Connection {
             return Err(Error::BufferTooShort);
         }
 
-        self.dgram_send_queue.push(buf)?;
+        self.dgram_send_queue.push(buf, 0)?;
 
         let active_path = self.paths.get_active_mut()?;
 
@@ -7279,10 +7281,10 @@ impl Connection {
 
                 // If recv queue is full, discard oldest
                 if self.dgram_recv_queue.is_full() {
-                    self.dgram_recv_queue.pop();
+                    self.dgram_recv_queue.pop(0);
                 }
 
-                self.dgram_recv_queue.push(data)?;
+                self.dgram_recv_queue.push(data, 0)?;
             },
 
             frame::Frame::DatagramHeader { .. } => unreachable!(),
@@ -16673,6 +16675,7 @@ mod tests {
         assert_eq!(flight[0].1.to, client_addr);
         assert_eq!(flight[1].1.to, client_addr_2);
 
+        assert_eq!(testing::process_flight(&mut pipe.server, flight), Ok(()));
     }
 
     #[test]
