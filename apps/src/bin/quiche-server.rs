@@ -799,23 +799,25 @@ fn handle_path_events(client: &mut Client) {
 
             quiche::PathEvent::InsertGroup(group_id, addr) => {
                 info!("Peer inserts path {:?} into group {}", addr, group_id);
-                client.prepared = true;
-                client
-                    .conn
-                    .stream_group(3, 1)
-                    .ok();
-                client
-                    .conn
-                    .stream_group(7, 1)
-                    .ok();
-                client
-                    .conn
-                    .stream_group(11, 1)
-                    .ok();
-                client
-                    .conn
-                    .stream_group(15, 1)
-                    .ok();
+                if group_id == 1 {
+                    client.prepared = true;
+                    client
+                        .conn
+                        .stream_group(3, 1)
+                        .ok();
+                    client
+                        .conn
+                        .stream_group(7, 1)
+                        .ok();
+                    client
+                        .conn
+                        .stream_group(11, 1)
+                        .ok();
+                    client
+                        .conn
+                        .stream_group(15, 1)
+                        .ok();
+                }
 
             },
 
