@@ -4742,6 +4742,7 @@ impl Connection {
         // Get existing stream or create a new one.
         let stream = self.get_or_create_stream(stream_id, true)?;
 
+        println!("stream_send: group_is={}", stream.group_id);
         #[cfg(feature = "qlog")]
         let offset = stream.send.off_back();
 
