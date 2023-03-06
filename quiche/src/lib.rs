@@ -4184,7 +4184,7 @@ impl Connection {
             !dgram_emitted &&
             (consider_standby_paths || !path.is_standby())
         {
-            println!("send_pid: {send_pid}, group: {:?}", path.group());
+            println!("send_pid: {send_pid}, group: {:?}, is_server={}", path.group(), self.is_server);
             while let Some((stream_id, group_id)) = self.streams.peek_flushable(path.group()) {
                 let stream = match self.streams.get_mut(stream_id) {
                     // Avoid sending frames for streams that were already stopped.
@@ -5915,7 +5915,7 @@ impl Connection {
 
     pub fn insert_group(&mut self, local: SocketAddr, peer: SocketAddr, group_id: u64) -> Result<bool> {
         if let Some(path_id) = self.paths.path_id_from_addrs(&(local, peer)) {
-            info!("insert_group: path_id={path_id}, local={local:?}, peer={peer:?}");
+            println!("insert_group: path_id={path_id}, local={local:?}, peer={peer:?}, group_id={group_id}");
             let path = self.paths.get(path_id)?;
             if path.active_scid_seq.is_some() {
                 return self.paths.insert_group(group_id, path_id, self.is_server);
@@ -6747,6 +6747,7 @@ impl Connection {
                 self.ids.has_retire_dcids() ||
                 self.paths.has_path_abandon() ||
                 self.paths.has_path_status() ||
+                self.paths.has_path_set_group() ||
                 send_path.needs_ack_eliciting ||
                 send_path.probing_required())
         {
@@ -16563,6 +16564,30 @@ mod tests {
         let cid_c2s_0 = pipe.client.destination_id().into_owned();
         let cid_s2c_0 = pipe.server.destination_id().into_owned();
 
+        let pid_c2s_0 = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(client_addr, server_addr))
+            .expect("no such path");
+        let pid_s2c_0 = pipe
+            .server
+            .paths
+            .path_id_from_addrs(&(server_addr, client_addr))
+            .expect("no such path");
+
+        let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
+        let path_s2c_0 = pipe.server.paths.get(pid_s2c_0).expect("no such path");
+
+        assert_eq!(path_c2s_0.active(), true);
+        assert_eq!(path_s2c_0.active(), true);
+
+        assert_eq!(pipe.client.insert_group(client_addr, server_addr, 1), Ok(true));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::InsertGroup(1, (server_addr, client_addr)))
+        );
+
         assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
         assert_eq!(pipe.advance(), Ok(()));
         assert_eq!(
@@ -16584,27 +16609,17 @@ mod tests {
         );
         assert_eq!(pipe.server.path_event_next(), None);
 
-        assert_eq!(pipe.client.insert_group(client_addr_2, server_addr, 1), Ok(true));
+        assert_eq!(pipe.client.insert_group(client_addr_2, server_addr, 2), Ok(true));
         assert_eq!(pipe.advance(), Ok(()));
         assert_eq!(
             pipe.server.path_event_next(),
-            Some(PathEvent::InsertGroup(1, (server_addr, client_addr_2)))
+            Some(PathEvent::InsertGroup(2, (server_addr, client_addr_2)))
         );
 
-        let pid_c2s_0 = pipe
-            .client
-            .paths
-            .path_id_from_addrs(&(client_addr, server_addr))
-            .expect("no such path");
         let pid_c2s_1 = pipe
             .client
             .paths
             .path_id_from_addrs(&(client_addr_2, server_addr))
-            .expect("no such path");
-        let pid_s2c_0 = pipe
-            .server
-            .paths
-            .path_id_from_addrs(&(server_addr, client_addr))
             .expect("no such path");
         let pid_s2c_1 = pipe
             .server
@@ -16612,14 +16627,10 @@ mod tests {
             .path_id_from_addrs(&(server_addr, client_addr_2))
             .expect("no such path");
 
-        let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
         let path_c2s_1 = pipe.client.paths.get(pid_c2s_1).expect("no such path");
-        let path_s2c_0 = pipe.server.paths.get(pid_s2c_0).expect("no such path");
         let path_s2c_1 = pipe.server.paths.get(pid_s2c_1).expect("no such path");
 
-        assert_eq!(path_c2s_0.active(), true);
         assert_eq!(path_c2s_1.active(), false);
-        assert_eq!(path_s2c_0.active(), true);
         assert_eq!(path_s2c_1.active(), false);
 
         assert_eq!(
@@ -16633,13 +16644,34 @@ mod tests {
 
         assert_eq!(pipe.client.stream_group(0, 1), Ok(()));
         assert_eq!(pipe.client.stream_priority(0, 127, true), Ok(()));
-        assert_eq!(pipe.client.stream_group(4, 0), Ok(()));
+        assert_eq!(pipe.client.stream_group(4, 2), Ok(()));
         assert_eq!(pipe.client.stream_priority(4, 255, true), Ok(()));
 
         assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
         assert_eq!(pipe.client.stream_send(4, b"a", false), Ok(1));
 
+        let flight = testing::emit_flight(&mut pipe.client).unwrap();
+
+        assert_eq!(flight.len(), 2);
+        assert_eq!(flight[0].1.from, client_addr);
+        assert_eq!(flight[1].1.from, client_addr_2);
+
+        assert_eq!(testing::process_flight(&mut pipe.server, flight), Ok(()));
         assert_eq!(pipe.advance(), Ok(()));
+
+        assert_eq!(pipe.server.stream_group(1, 1), Ok(()));
+        assert_eq!(pipe.server.stream_priority(0, 127, true), Ok(()));
+        assert_eq!(pipe.server.stream_group(5, 2), Ok(()));
+        assert_eq!(pipe.server.stream_priority(4, 255, true), Ok(()));
+
+        assert_eq!(pipe.server.stream_send(1, b"a", false), Ok(1));
+        assert_eq!(pipe.server.stream_send(5, b"a", false), Ok(1));
+
+        let flight = testing::emit_flight(&mut pipe.server).unwrap();
+
+        assert_eq!(flight.len(), 2);
+        assert_eq!(flight[0].1.to, client_addr);
+        assert_eq!(flight[1].1.to, client_addr_2);
 
     }
 

@@ -926,7 +926,7 @@ impl PathMap {
             self.notify_event(PathEvent::New(local_addr, peer_addr));
         }
 
-        if self.insert_group(0, pid, is_server)? {
+        if !self.insert_group(0, pid, is_server)? {
             warn!("Newly inserted path {pid} already exists!");
         }
 
@@ -1330,6 +1330,7 @@ impl PathMap {
     /// Adds or remove the path ID from the set of paths requiring sending a
     /// PATH_ABANDON frame.
     pub fn mark_advertise_path_set_group(&mut self, group_id: u64, advertise: bool) {
+        println!("mark_advertise_path_set_group");
         if advertise {
             self.advertise_path_set_group.push_back(group_id);
         } else {
@@ -1340,6 +1341,7 @@ impl PathMap {
     /// Returns the Path ID that should be advertised in the next PATH_ABANDON
     /// frame.
     pub fn next_advertise_path_set_group(&mut self) -> Option<(u64, u64)> {
+        println!("next_advertise_path_set_group");
         self.advertise_path_set_group
             .front()
             .copied()
@@ -1348,6 +1350,12 @@ impl PathMap {
                 self.next_path_set_group_seq_num += 1;
                 (gid, seq_num)
             })
+    }
+
+    /// Returns true if the host should send a PATH_SET_GROUP frame.
+    #[inline]
+    pub fn has_path_set_group(&self) -> bool {
+        !self.advertise_path_set_group.is_empty()
     }
 
     pub fn on_path_set_group_lost(&mut self, group_id: u64, seq_num: u64) {
