@@ -4184,7 +4184,6 @@ impl Connection {
             !dgram_emitted &&
             (consider_standby_paths || !path.is_standby())
         {
-            println!("send_pid: {send_pid}, group: {:?}, is_server={}", path.group(), self.is_server);
             while let Some((stream_id, group_id)) = self.streams.peek_flushable(path.group()) {
                 let stream = match self.streams.get_mut(stream_id) {
                     // Avoid sending frames for streams that were already stopped.
@@ -5427,6 +5426,20 @@ impl Connection {
     }
 
     pub fn dgram_send_group(&mut self, buf: &[u8], group_id: u64) -> Result<()> {
+        if !self.paths
+            .get_group2(group_id)?
+            .filter_map(|pid| {
+                self.paths
+                    .get(pid)
+                    .ok()
+            })
+            .any(|p| {
+                p.usable()
+            })
+        {
+            // No usable path
+            return Err(Error::InvalidState);
+        }
         let max_payload_len = match self.dgram_max_writable_len() {
             Some(v) => v,
 
@@ -5437,6 +5450,7 @@ impl Connection {
             return Err(Error::BufferTooShort);
         }
 
+        println!("group_id={group_id}");
         self.dgram_send_queue.push(buf.to_vec(), group_id)?;
 
         let active_path = self.paths.get_active_mut()?;
