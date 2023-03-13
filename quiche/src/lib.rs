@@ -5450,7 +5450,6 @@ impl Connection {
             return Err(Error::BufferTooShort);
         }
 
-        println!("group_id={group_id}");
         self.dgram_send_queue.push(buf.to_vec(), group_id)?;
 
         let active_path = self.paths.get_active_mut()?;
@@ -7718,7 +7717,6 @@ impl Connection {
                 self.streams.get_group_highest_urgency().expect("not flushable")
             };
             let path_ids = self.paths.get_group(group_id)?;
-            println!("group_id: {group_id}, path_ids: {:?}", path_ids);
             // We loop at most twice.
             loop {
                 if let Some(pid) = path_ids
@@ -7739,7 +7737,6 @@ impl Connection {
                     .min_by_key(|(_, p)| p.recovery.rtt())
                     .map(|(pid, _)| pid)
                 {
-                    println!("pid: {pid}");
                     return Ok(pid);
                 }
                 if consider_standby || !self.paths.consider_standby_paths() {
