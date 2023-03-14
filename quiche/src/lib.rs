@@ -16805,6 +16805,8 @@ pub use crate::packet::Type;
 pub use crate::path::PathEvent;
 pub use crate::path::PathStats;
 pub use crate::path::PathStatus;
+pub use crate::path::PathValidationState;
+pub use crate::path::PathState;
 pub use crate::path::SocketAddrIter;
 
 pub use crate::recovery::CongestionControlAlgorithm;

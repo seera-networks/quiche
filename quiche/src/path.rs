@@ -75,7 +75,7 @@ impl PathValidationState {
 
 /// The different usage states of the path.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum PathState {
+pub enum PathState {
     /// The path only sends probing packets.
     Unused,
     /// The path can send non-probing packets.
@@ -652,6 +652,7 @@ impl Path {
             stream_retrans_bytes: self.stream_retrans_bytes,
             pmtu: self.recovery.max_datagram_size(),
             delivery_rate: self.recovery.delivery_rate(),
+            group_ids: self.group(),
         }
     }
 }
@@ -1460,6 +1461,8 @@ pub struct PathStats {
     /// [`SendInfo.at`]: struct.SendInfo.html#structfield.at
     /// [Pacing]: index.html#pacing
     pub delivery_rate: u64,
+
+    pub group_ids: Vec<u64>,
 }
 
 impl std::fmt::Debug for PathStats {
@@ -1497,6 +1500,12 @@ impl std::fmt::Debug for PathStats {
             f,
             " stream_retrans_bytes={} pmtu={} delivery_rate={}",
             self.stream_retrans_bytes, self.pmtu, self.delivery_rate,
+        )?;
+
+        write!(
+            f,
+            " group_ids={:?}",
+            self.group_ids,
         )
     }
 }
