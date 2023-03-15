@@ -3947,11 +3947,10 @@ impl Connection {
 
             while let Some((group_identifier, seq_num)) = self.paths.next_advertise_path_set_group()
             {
-                let pids = self.paths.get_group(group_identifier)?;
-                let path_identifiers = pids.iter()
+                let path_identifiers = self.paths.get_group(group_identifier)?
                     .map(|pid| {
                         self.paths
-                            .get(*pid)
+                            .get(pid)
                             .and_then(|p| {
                                 p.active_scid_seq
                                     .ok_or(Error::InvalidState)
@@ -4819,7 +4818,7 @@ impl Connection {
         &mut self, stream_id: u64, group_id: u64,
     ) -> Result<()> {
         if !self.paths
-            .get_group2(group_id)?
+            .get_group(group_id)?
             .filter_map(|pid| {
                 self.paths
                     .get(pid)
@@ -5425,9 +5424,10 @@ impl Connection {
         self.dgram_send_group(buf, 0)
     }
 
+    /// Sends data in a DATAGRAM frame using a specified path group.
     pub fn dgram_send_group(&mut self, buf: &[u8], group_id: u64) -> Result<()> {
         if !self.paths
-            .get_group2(group_id)?
+            .get_group(group_id)?
             .filter_map(|pid| {
                 self.paths
                     .get(pid)
@@ -5473,6 +5473,7 @@ impl Connection {
         self.dgram_send_vec_group(buf, 0)
     }
 
+    /// Sends data in a DATAGRAM frame using a specified path group.
     pub fn dgram_send_vec_group(&mut self, buf: Vec<u8>, group_id: u64) -> Result<()> {
         let max_payload_len = match self.dgram_max_writable_len() {
             Some(v) => v,
@@ -5934,7 +5935,10 @@ impl Connection {
         Ok(())
     }
 
-    pub fn insert_group(&mut self, local: SocketAddr, peer: SocketAddr, group_id: u64) -> Result<bool> {
+    /// Insert the path into a path group, and advertises it to the peer.
+    pub fn insert_group(
+        &mut self, local: SocketAddr, peer: SocketAddr, group_id: u64
+    ) -> Result<bool> {
         if let Some(path_id) = self.paths.path_id_from_addrs(&(local, peer)) {
             let path = self.paths.get(path_id)?;
             if path.active_scid_seq.is_some() {
@@ -6476,6 +6480,8 @@ impl Connection {
         self.paths.iter().map(|(_, p)| p.stats())
     }
 
+    /// Collects and returns statistics about the paths which are inserted into
+    /// the path group having the flushable stream/dgram.
     pub fn path_flushable_stats(&self) -> impl Iterator<Item = PathStats> + '_ {
         let group_id = self.streams.get_group_highest_urgency();
         self.paths
@@ -7122,7 +7128,7 @@ impl Connection {
                 if stream.is_flushable() && !was_flushable {
                     let urgency = stream.urgency;
                     let incremental = stream.incremental;
-                    self.streams.push_flushable(stream_id, urgency, incremental);
+                    self.streams.push_flushable(stream_id, urgency, incremental)?;
                 }
 
                 if writable {
@@ -7712,19 +7718,17 @@ impl Connection {
         // If we have standby paths, we may run the loop a second time.
         if self.paths.multipath() && (dgrams_to_emit || stream_to_emit) {
             let group_id = if (self.emit_dgram || !stream_to_emit) && dgrams_to_emit {
-                self.dgram_send_queue.get_group_pending().expect("pending")
+                self.dgram_send_queue.get_group_pending().expect("no pending")
             } else {
-                self.streams.get_group_highest_urgency().expect("not flushable")
+                self.streams.get_group_highest_urgency().expect("no flushable")
             };
-            let path_ids = self.paths.get_group(group_id)?;
             // We loop at most twice.
             loop {
-                if let Some(pid) = path_ids
-                    .iter()
+                if let Some(pid) = self.paths.get_group(group_id)?
                     .filter_map(|pid| {
-                        self.paths.get(*pid)
+                        self.paths.get(pid)
                             .ok()
-                            .map(|p| (*pid, p))
+                            .map(|p| (pid, p))
                     })
                     .filter(|(_, p)| {
                         // Follow the filter provided as parameters.

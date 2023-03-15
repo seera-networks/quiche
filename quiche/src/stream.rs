@@ -447,7 +447,6 @@ impl StreamMap {
                 }
             })
         {
-            println!("gid: {gid}, urgency: {urgency}, incremental: {incremental}, sid: {sid}");
             if incremental {
                 let queues = self.flushable
                     .get_mut(&gid)
@@ -465,7 +464,6 @@ impl StreamMap {
 
     /// Remove the last peeked stream
     pub fn remove_flushable(&mut self, group_id: u64) {
-        println!("group_id: {group_id}");
         let mut top_urgency = self
             .flushable
             .get_mut(&group_id)

@@ -24,7 +24,6 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::convert::TryInto;
 use std::iter::FromIterator;
 use std::time;
 
@@ -159,6 +158,8 @@ pub enum PathEvent {
     /// anymore, unless the application requests probing this path again.
     FailedValidation(SocketAddr, SocketAddr),
 
+    /// The return network path between peer `SocketAddr` and local
+    /// `SocketAddr` is notified using Path Challenge.
     ReturnAvailable(SocketAddr, SocketAddr),
 
     /// The related network path between local `SocketAddr` and peer
@@ -185,8 +186,10 @@ pub enum PathEvent {
     /// The peer advertised the path status for the mentioned 4-tuple.
     PeerPathStatus((SocketAddr, SocketAddr), PathStatus),
 
+    /// The peer advertised the path group and the inserted path.
     InsertGroup(u64, (SocketAddr, SocketAddr)),
 
+    /// The peer advertised the path group and the removed path.
     RemoveGroup(u64, (SocketAddr, SocketAddr)),
 }
 
@@ -934,32 +937,13 @@ impl PathMap {
         Ok(pid)
     }
 
-    #[inline]
-    pub fn get_group_ids(&self) -> Vec<u64> {
-        self.groups
-            .iter()
-            .map(|(gid, _)| *gid)
-            .collect::<Vec<_>>()
-    }
-
-    /// Gets an immutable reference to the group identified by `group_id`. If the
-    /// provided `group_id` does not identify any current `PathGroup`, returns an
-    /// [`InvalidState`].
+    /// Returns an iterator over all existing path ids which are inserted into the path
+    /// group identified by `group_id`. If the provided `group_id` does not identify
+    /// any current path group, returns an [`InvalidState`].
     ///
     /// [`InvalidState`]: enum.Error.html#variant.InvalidState
     #[inline]
-    pub fn get_group(&self, group_id: u64) -> Result<Vec<usize>> {
-        let pids = self.groups
-            .get(&group_id)
-            .ok_or(Error::InvalidState)?
-            .iter()
-            .copied()
-            .collect::<Vec<usize>>();
-        Ok(pids)
-    }
-
-    #[inline]
-    pub fn get_group2(&self, group_id: u64) -> Result<impl Iterator<Item = usize> + '_> {
+    pub fn get_group(&self, group_id: u64) -> Result<impl Iterator<Item = usize> + '_> {
         let iter = self.groups
             .get(&group_id)
             .ok_or(Error::InvalidState)?
@@ -1329,9 +1313,8 @@ impl PathMap {
     }
 
     /// Adds or remove the path ID from the set of paths requiring sending a
-    /// PATH_ABANDON frame.
+    /// PATH_SET_GROUP frame.
     pub fn mark_advertise_path_set_group(&mut self, group_id: u64, advertise: bool) {
-        println!("mark_advertise_path_set_group");
         if advertise {
             self.advertise_path_set_group.push_back(group_id);
         } else {
@@ -1339,7 +1322,7 @@ impl PathMap {
         }
     }
 
-    /// Returns the Path ID that should be advertised in the next PATH_ABANDON
+    /// Returns the Path ID that should be advertised in the next PATH_SET_GROUP
     /// frame.
     pub fn next_advertise_path_set_group(&mut self) -> Option<(u64, u64)> {
         self.advertise_path_set_group
@@ -1462,6 +1445,7 @@ pub struct PathStats {
     /// [Pacing]: index.html#pacing
     pub delivery_rate: u64,
 
+    /// The path group IDs using this path.
     pub group_ids: Vec<u64>,
 }
 
