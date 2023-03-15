@@ -378,6 +378,7 @@ fn main() {
                     partial_responses: HashMap::new(),
                     siduck_conn: None,
                     app_proto_selected: false,
+                    prepared: false,
                     max_datagram_size,
                     loss_rate: 0.0,
                     max_send_burst: MAX_BUF_SIZE,
@@ -419,6 +420,7 @@ fn main() {
             // Create a new application protocol session as soon as the QUIC
             // connection is established.
             if !client.app_proto_selected &&
+                client.prepared &&
                 (client.conn.is_in_early_data() ||
                     client.conn.is_established())
             {
@@ -792,6 +794,34 @@ fn handle_path_events(client: &mut Client) {
                     .map_err(|e| error!("cannot follow status request: {}", e))
                     .ok();
             },
+
+            quiche::PathEvent::ReturnAvailable(..) => {},
+
+            quiche::PathEvent::InsertGroup(group_id, addr) => {
+                info!("Peer inserts path {:?} into group {}", addr, group_id);
+                if group_id == 1 {
+                    client.prepared = true;
+                    client
+                        .conn
+                        .stream_group(3, 1)
+                        .ok();
+                    client
+                        .conn
+                        .stream_group(7, 1)
+                        .ok();
+                    client
+                        .conn
+                        .stream_group(11, 1)
+                        .ok();
+                    client
+                        .conn
+                        .stream_group(15, 1)
+                        .ok();
+                }
+
+            },
+
+            quiche::PathEvent::RemoveGroup(..) => {},
         }
     }
 }

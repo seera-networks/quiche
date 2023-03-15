@@ -1346,6 +1346,9 @@ pub struct Connection {
 
     /// Structure used when coping with abandoned paths in multipath.
     wire_pids_to_close: VecDeque<(u64, Option<u64>)>,
+
+    /// Structure used when coping with PathSetGroups in multipath.
+    lost_path_set_groups: VecDeque<(u64, u64)>,
 }
 
 /// Creates a new server-side connection.
@@ -1778,6 +1781,8 @@ impl Connection {
             disable_dcid_reuse: config.disable_dcid_reuse,
 
             wire_pids_to_close: VecDeque::new(),
+
+            lost_path_set_groups: VecDeque::new(),
         };
 
         // Don't support multipath with zero-length CIDs.
@@ -3210,6 +3215,7 @@ impl Connection {
 
         let multiple_application_data_pkt_num_spaces =
             self.use_path_pkt_num_space(epoch);
+        
         // Process lost frames. There might be several paths having lost frames.
         for (_, p) in self.paths.iter_mut() {
             for lost in p.recovery.lost[epoch].drain(..) {
@@ -3262,7 +3268,7 @@ impl Connection {
                                 stream_id,
                                 urgency,
                                 incremental,
-                            );
+                            )?;
                         }
 
                         self.stream_retrans_bytes += length as u64;
@@ -3329,9 +3335,21 @@ impl Connection {
                             .ok();
                     },
 
+                    frame::Frame::PathSetGroup {
+                        group_identifier,
+                        seq_num,
+                        ..
+                    } => {
+                        self.lost_path_set_groups.push_back((group_identifier, seq_num));
+                    },
+
                     _ => (),
                 }
             }
+        }
+
+        for (group_id, seq_num) in self.lost_path_set_groups.drain(..) {
+            self.paths.on_path_set_group_lost(group_id, seq_num);
         }
 
         let consider_standby_paths = self.paths.consider_standby_paths();
@@ -3926,6 +3944,34 @@ impl Connection {
                     break;
                 }
             }
+
+            while let Some((group_identifier, seq_num)) = self.paths.next_advertise_path_set_group()
+            {
+                let pids = self.paths.get_group(group_identifier)?;
+                let path_identifiers = pids.iter()
+                    .map(|pid| {
+                        self.paths
+                            .get(*pid)
+                            .and_then(|p| {
+                                p.active_scid_seq
+                                    .ok_or(Error::InvalidState)
+                            })
+                    })
+                    .collect::<Result<Vec<u64>>>()?;
+                
+                let frame = frame::Frame::PathSetGroup {
+                    group_identifier,
+                    seq_num,
+                    path_identifiers,
+                };
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.paths.mark_advertise_path_set_group(group_identifier, false);       
+                    ack_eliciting = true;
+                    in_flight = true;
+                } else {
+                    break;
+                }
+            }
         }
 
         let path = self.paths.get_mut(send_pid)?;
@@ -4060,14 +4106,14 @@ impl Connection {
             do_dgram
         {
             if let Some(max_dgram_payload) = max_dgram_len {
-                while let Some(len) = self.dgram_send_queue.peek_front_len() {
+                while let Some((group_id, len)) = self.dgram_send_queue.peek_front_len(path.group()) {
                     let hdr_off = b.off();
                     let hdr_len = 1 + // frame type
                         2; // length, always encode as 2-byte varint
 
                     if (hdr_len + len) <= left {
                         // Front of the queue fits this packet, send it.
-                        match self.dgram_send_queue.pop() {
+                        match self.dgram_send_queue.pop(group_id) {
                             Some(data) => {
                                 // Encode the frame.
                                 //
@@ -4122,7 +4168,7 @@ impl Connection {
                         };
                     } else if len > max_dgram_payload {
                         // This dgram frame will never fit. Let's purge it.
-                        self.dgram_send_queue.pop();
+                        self.dgram_send_queue.pop(group_id);
                     } else {
                         break;
                     }
@@ -4138,7 +4184,7 @@ impl Connection {
             !dgram_emitted &&
             (consider_standby_paths || !path.is_standby())
         {
-            while let Some(stream_id) = self.streams.peek_flushable() {
+            while let Some((stream_id, group_id)) = self.streams.peek_flushable(path.group()) {
                 let stream = match self.streams.get_mut(stream_id) {
                     // Avoid sending frames for streams that were already stopped.
                     //
@@ -4146,7 +4192,7 @@ impl Connection {
                     // flushed on the wire when a STOP_SENDING frame is received.
                     Some(v) if !v.send.is_stopped() => v,
                     _ => {
-                        self.streams.remove_flushable();
+                        self.streams.remove_flushable(group_id);
                         continue;
                     },
                 };
@@ -4175,7 +4221,7 @@ impl Connection {
                 let max_len = match left.checked_sub(hdr_len) {
                     Some(v) => v,
                     None => {
-                        self.streams.remove_flushable();
+                        self.streams.remove_flushable(group_id);
                         continue;
                     },
                 };
@@ -4221,7 +4267,7 @@ impl Connection {
 
                 // If the stream is no longer flushable, remove it from the queue
                 if !stream.is_flushable() {
-                    self.streams.remove_flushable();
+                    self.streams.remove_flushable(group_id);
                 }
 
                 break;
@@ -4736,7 +4782,7 @@ impl Connection {
         // Consider the stream flushable also when we are sending a zero-length
         // frame that has the fin flag set.
         if (flushable || empty_fin) && !was_flushable {
-            self.streams.push_flushable(stream_id, urgency, incremental);
+            self.streams.push_flushable(stream_id, urgency, incremental)?;
         }
 
         if !writable {
@@ -4766,6 +4812,36 @@ impl Connection {
         }
 
         Ok(sent)
+    }
+
+    /// Sets the group for a stream.
+    pub fn stream_group(
+        &mut self, stream_id: u64, group_id: u64,
+    ) -> Result<()> {
+        if !self.paths
+            .get_group2(group_id)?
+            .filter_map(|pid| {
+                self.paths
+                    .get(pid)
+                    .ok()
+            })
+            .any(|p| {
+                p.usable()
+            })
+        {
+            // No usable path
+            return Err(Error::InvalidState);
+        }
+        // Get existing stream or create a new one
+        let stream = match self.get_or_create_stream(stream_id, true) {
+            Ok(v) => v,
+
+            Err(e) => return Err(e),
+        };
+
+        stream.group_id = group_id;
+
+        Ok(())
     }
 
     /// Sets the priority for a stream.
@@ -5222,7 +5298,7 @@ impl Connection {
     /// ```
     #[inline]
     pub fn dgram_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
-        match self.dgram_recv_queue.pop() {
+        match self.dgram_recv_queue.pop(0) {
             Some(d) => {
                 if d.len() > buf.len() {
                     return Err(Error::BufferTooShort);
@@ -5244,7 +5320,7 @@ impl Connection {
     /// [`dgram_recv()`]: struct.Connection.html#method.dgram_recv
     #[inline]
     pub fn dgram_recv_vec(&mut self) -> Result<Vec<u8>> {
-        match self.dgram_recv_queue.pop() {
+        match self.dgram_recv_queue.pop(0) {
             Some(d) => Ok(d),
 
             None => Err(Error::Done),
@@ -5266,13 +5342,15 @@ impl Connection {
     /// [`BufferTooShort`]: enum.Error.html#variant.BufferTooShort
     #[inline]
     pub fn dgram_recv_peek(&self, buf: &mut [u8], len: usize) -> Result<usize> {
-        self.dgram_recv_queue.peek_front_bytes(buf, len)
+        let (_, len) = self.dgram_recv_queue.peek_front_bytes(buf, len, vec![0])?;
+        Ok(len)
     }
 
     /// Returns the length of the first stored DATAGRAM.
     #[inline]
     pub fn dgram_recv_front_len(&self) -> Option<usize> {
-        self.dgram_recv_queue.peek_front_len()
+        let (_, len) = self.dgram_recv_queue.peek_front_len(vec![0])?;
+        Some(len)
     }
 
     /// Returns the number of items in the DATAGRAM receive queue.
@@ -5344,6 +5422,24 @@ impl Connection {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn dgram_send(&mut self, buf: &[u8]) -> Result<()> {
+        self.dgram_send_group(buf, 0)
+    }
+
+    pub fn dgram_send_group(&mut self, buf: &[u8], group_id: u64) -> Result<()> {
+        if !self.paths
+            .get_group2(group_id)?
+            .filter_map(|pid| {
+                self.paths
+                    .get(pid)
+                    .ok()
+            })
+            .any(|p| {
+                p.usable()
+            })
+        {
+            // No usable path
+            return Err(Error::InvalidState);
+        }
         let max_payload_len = match self.dgram_max_writable_len() {
             Some(v) => v,
 
@@ -5354,7 +5450,7 @@ impl Connection {
             return Err(Error::BufferTooShort);
         }
 
-        self.dgram_send_queue.push(buf.to_vec())?;
+        self.dgram_send_queue.push(buf.to_vec(), group_id)?;
 
         let active_path = self.paths.get_active_mut()?;
 
@@ -5374,6 +5470,10 @@ impl Connection {
     ///
     /// [`dgram_send()`]: struct.Connection.html#method.dgram_send
     pub fn dgram_send_vec(&mut self, buf: Vec<u8>) -> Result<()> {
+        self.dgram_send_vec_group(buf, 0)
+    }
+
+    pub fn dgram_send_vec_group(&mut self, buf: Vec<u8>, group_id: u64) -> Result<()> {
         let max_payload_len = match self.dgram_max_writable_len() {
             Some(v) => v,
 
@@ -5384,7 +5484,7 @@ impl Connection {
             return Err(Error::BufferTooShort);
         }
 
-        self.dgram_send_queue.push(buf)?;
+        self.dgram_send_queue.push(buf, group_id)?;
 
         let active_path = self.paths.get_active_mut()?;
 
@@ -5832,6 +5932,16 @@ impl Connection {
         }
 
         Ok(())
+    }
+
+    pub fn insert_group(&mut self, local: SocketAddr, peer: SocketAddr, group_id: u64) -> Result<bool> {
+        if let Some(path_id) = self.paths.path_id_from_addrs(&(local, peer)) {
+            let path = self.paths.get(path_id)?;
+            if path.active_scid_seq.is_some() {
+                return self.paths.insert_group(group_id, path_id, self.is_server);
+            }
+        }
+        Err(Error::InvalidState)
     }
 
     /// Provides additional source Connection IDs that the peer can use to reach
@@ -6366,6 +6476,19 @@ impl Connection {
         self.paths.iter().map(|(_, p)| p.stats())
     }
 
+    pub fn path_flushable_stats(&self) -> impl Iterator<Item = PathStats> + '_ {
+        let group_id = self.streams.get_group_highest_urgency();
+        self.paths
+            .iter()
+            .filter_map(move |(_, p)| {
+                if group_id.is_some() && p.group().contains(&group_id.unwrap()) {
+                    Some(p.stats())
+                } else {
+                    None
+            }
+            })
+}
+
     fn encode_transport_params(&mut self) -> Result<()> {
         let mut raw_params = [0; 128];
 
@@ -6644,6 +6767,7 @@ impl Connection {
                 self.ids.has_retire_dcids() ||
                 self.paths.has_path_abandon() ||
                 self.paths.has_path_status() ||
+                self.paths.has_path_set_group() ||
                 send_path.needs_ack_eliciting ||
                 send_path.probing_required())
         {
@@ -7120,8 +7244,7 @@ impl Connection {
 
             frame::Frame::PathChallenge { data } => {
                 self.paths
-                    .get_mut(recv_path_id)?
-                    .on_challenge_received(data);
+                    .on_challenge_received(recv_path_id, data, self.is_server)?;
             },
 
             frame::Frame::PathResponse { data } => {
@@ -7176,10 +7299,10 @@ impl Connection {
 
                 // If recv queue is full, discard oldest
                 if self.dgram_recv_queue.is_full() {
-                    self.dgram_recv_queue.pop();
+                    self.dgram_recv_queue.pop(0);
                 }
 
-                self.dgram_recv_queue.push(data)?;
+                self.dgram_recv_queue.push(data, 0)?;
             },
 
             frame::Frame::DatagramHeader { .. } => unreachable!(),
@@ -7289,6 +7412,27 @@ impl Connection {
                 )?;
                 self.paths.on_path_status_received(pid, seq_num, status);
             },
+
+            frame::Frame::PathSetGroup {
+                group_identifier,
+                seq_num,
+                path_identifiers,
+            } => {
+                if !self.is_server {
+                    return Err(Error::MultiPathViolation);
+                }
+                let pids = path_identifiers.iter()
+                    .map(|dcid_seq_num| {
+                        self.ids
+                            .get_dcid(*dcid_seq_num)
+                            .and_then(|e| {
+                                e.path_id.ok_or(Error::InvalidState)
+                            })
+                    })
+                    .collect::<Result<Vec<usize>>>()?;
+                self.paths.on_path_set_group_received(group_identifier, seq_num, pids)?;
+            }
+
         };
         Ok(())
     }
@@ -7567,11 +7711,21 @@ impl Connection {
         // is open. This should only be used when data need to be sent.
         // If we have standby paths, we may run the loop a second time.
         if self.paths.multipath() && (dgrams_to_emit || stream_to_emit) {
+            let group_id = if (self.emit_dgram || !stream_to_emit) && dgrams_to_emit {
+                self.dgram_send_queue.get_group_pending().expect("pending")
+            } else {
+                self.streams.get_group_highest_urgency().expect("not flushable")
+            };
+            let path_ids = self.paths.get_group(group_id)?;
             // We loop at most twice.
             loop {
-                if let Some(pid) = self
-                    .paths
+                if let Some(pid) = path_ids
                     .iter()
+                    .filter_map(|pid| {
+                        self.paths.get(*pid)
+                            .ok()
+                            .map(|p| (*pid, p))
+                    })
                     .filter(|(_, p)| {
                         // Follow the filter provided as parameters.
                         let local = from.map(|f| f == p.local_addr()).unwrap_or(true);
@@ -16397,6 +16551,251 @@ mod tests {
 
         assert_eq!(pipe.client.is_multipath_enabled(), false);
     }
+
+    #[test]
+    fn path_set_group() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(3);
+        config.set_initial_max_data(100000);
+        config.set_initial_max_stream_data_bidi_local(100000);
+        config.set_initial_max_stream_data_bidi_remote(100000);
+        config.set_initial_max_streams_bidi(2);
+        // To test with enabled datagrams.
+        config.enable_dgram(true, 10, 10);
+        config.set_multipath(true);
+
+        let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+
+        assert_eq!(pipe.client.is_multipath_enabled(), true);
+        assert_eq!(pipe.server.is_multipath_enabled(), true);
+
+        let client_addr = testing::Pipe::client_addr();
+        let server_addr = testing::Pipe::server_addr();
+        let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+        let cid_c2s_0 = pipe.client.destination_id().into_owned();
+        let cid_s2c_0 = pipe.server.destination_id().into_owned();
+
+        let pid_c2s_0 = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(client_addr, server_addr))
+            .expect("no such path");
+        let pid_s2c_0 = pipe
+            .server
+            .paths
+            .path_id_from_addrs(&(server_addr, client_addr))
+            .expect("no such path");
+
+        let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
+        let path_s2c_0 = pipe.server.paths.get(pid_s2c_0).expect("no such path");
+
+        assert_eq!(path_c2s_0.active(), true);
+        assert_eq!(path_s2c_0.active(), true);
+
+        assert_eq!(pipe.client.insert_group(client_addr, server_addr, 1), Ok(true));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::InsertGroup(1, (server_addr, client_addr)))
+        );
+
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.client.path_event_next(),
+            Some(PathEvent::Validated(client_addr_2, server_addr))
+        );
+        assert_eq!(
+            pipe.client.path_event_next(),
+            Some(PathEvent::ReturnAvailable(client_addr_2, server_addr))
+        );
+        assert_eq!(pipe.client.path_event_next(), None);
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::New(server_addr, client_addr_2))
+        );
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::Validated(server_addr, client_addr_2))
+        );
+        assert_eq!(pipe.server.path_event_next(), None);
+
+        assert_eq!(pipe.client.insert_group(client_addr_2, server_addr, 2), Ok(true));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::InsertGroup(2, (server_addr, client_addr_2)))
+        );
+
+        let pid_c2s_1 = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(client_addr_2, server_addr))
+            .expect("no such path");
+        let pid_s2c_1 = pipe
+            .server
+            .paths
+            .path_id_from_addrs(&(server_addr, client_addr_2))
+            .expect("no such path");
+
+        let path_c2s_1 = pipe.client.paths.get(pid_c2s_1).expect("no such path");
+        let path_s2c_1 = pipe.server.paths.get(pid_s2c_1).expect("no such path");
+
+        assert_eq!(path_c2s_1.active(), false);
+        assert_eq!(path_s2c_1.active(), false);
+
+        assert_eq!(
+            pipe.client.set_active(client_addr_2, server_addr, true,),
+            Ok(())
+        );
+        assert_eq!(
+            pipe.server.set_active(server_addr, client_addr_2, true,),
+            Ok(())
+        );
+
+        assert_eq!(pipe.client.stream_group(0, 1), Ok(()));
+        assert_eq!(pipe.client.stream_priority(0, 127, true), Ok(()));
+        assert_eq!(pipe.client.stream_group(4, 2), Ok(()));
+        assert_eq!(pipe.client.stream_priority(4, 255, true), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
+        assert_eq!(pipe.client.stream_send(4, b"a", false), Ok(1));
+
+        let flight = testing::emit_flight(&mut pipe.client).unwrap();
+
+        assert_eq!(flight.len(), 2);
+        assert_eq!(flight[0].1.from, client_addr);
+        assert_eq!(flight[1].1.from, client_addr_2);
+
+        assert_eq!(testing::process_flight(&mut pipe.server, flight), Ok(()));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        assert_eq!(pipe.server.stream_group(1, 1), Ok(()));
+        assert_eq!(pipe.server.stream_priority(0, 127, true), Ok(()));
+        assert_eq!(pipe.server.stream_group(5, 2), Ok(()));
+        assert_eq!(pipe.server.stream_priority(4, 255, true), Ok(()));
+
+        assert_eq!(pipe.server.stream_send(1, b"a", false), Ok(1));
+        assert_eq!(pipe.server.stream_send(5, b"a", false), Ok(1));
+
+        let flight = testing::emit_flight(&mut pipe.server).unwrap();
+
+        assert_eq!(flight.len(), 2);
+        assert_eq!(flight[0].1.to, client_addr);
+        assert_eq!(flight[1].1.to, client_addr_2);
+
+        assert_eq!(testing::process_flight(&mut pipe.client, flight), Ok(()));
+
+        assert_eq!(pipe.client.dgram_send_group(b"a", 1), Ok(()));
+        assert_eq!(pipe.client.dgram_send_group(b"a", 2), Ok(()));
+        let flight = testing::emit_flight(&mut pipe.client).unwrap();
+
+        assert_eq!(flight.len(), 2);
+        assert_eq!(flight[0].1.from, client_addr);
+        assert_eq!(flight[1].1.from, client_addr_2);
+
+        assert_eq!(testing::process_flight(&mut pipe.server, flight), Ok(()));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        assert_eq!(pipe.server.dgram_send_group(b"a", 1), Ok(()));
+        assert_eq!(pipe.server.dgram_send_group(b"a", 2), Ok(()));
+        let flight = testing::emit_flight(&mut pipe.server).unwrap();
+
+        assert_eq!(flight.len(), 2);
+        assert_eq!(flight[0].1.to, client_addr);
+        assert_eq!(flight[1].1.to, client_addr_2);
+
+        assert_eq!(testing::process_flight(&mut pipe.client, flight), Ok(()));
+        assert_eq!(pipe.advance(), Ok(()));
+
+    }
+
+    #[test]
+    fn lost_path_set_group() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(3);
+        config.set_initial_max_data(100000);
+        config.set_initial_max_stream_data_bidi_local(100000);
+        config.set_initial_max_stream_data_bidi_remote(100000);
+        config.set_initial_max_streams_bidi(2);
+        // To test with enabled datagrams.
+        config.enable_dgram(true, 10, 10);
+        config.set_multipath(true);
+
+        let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+
+        assert_eq!(pipe.client.is_multipath_enabled(), true);
+        assert_eq!(pipe.server.is_multipath_enabled(), true);
+
+        let client_addr = testing::Pipe::client_addr();
+        let server_addr = testing::Pipe::server_addr();
+        let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+        let cid_c2s_0 = pipe.client.destination_id().into_owned();
+        let cid_s2c_0 = pipe.server.destination_id().into_owned();
+
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.client.path_event_next(),
+            Some(PathEvent::Validated(client_addr_2, server_addr))
+        );
+        assert_eq!(
+            pipe.client.path_event_next(),
+            Some(PathEvent::ReturnAvailable(client_addr_2, server_addr))
+        );
+        assert_eq!(pipe.client.path_event_next(), None);
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::New(server_addr, client_addr_2))
+        );
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::Validated(server_addr, client_addr_2))
+        );
+        assert_eq!(pipe.server.path_event_next(), None);
+
+        assert_eq!(pipe.client.insert_group(client_addr_2, server_addr, 1), Ok(true));
+        
+        // Packets are sent, but never received.
+        testing::emit_flight(&mut pipe.client).unwrap();
+
+        // Wait until timer expires. Since the RTT is very low, wait a bit more.
+        let timer = pipe.client.timeout().unwrap();
+        std::thread::sleep(timer + time::Duration::from_millis(1));
+
+        pipe.client.on_timeout();
+
+        // Let exchange packets over the connection.
+        assert_eq!(pipe.advance(), Ok(()));
+
+        // At this point, the server should be notified that it has a PathSetGroup.
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::InsertGroup(1, (server_addr, client_addr_2)))
+        );
+    }
 }
 
 pub use crate::packet::ConnectionId;
@@ -16406,6 +16805,8 @@ pub use crate::packet::Type;
 pub use crate::path::PathEvent;
 pub use crate::path::PathStats;
 pub use crate::path::PathStatus;
+pub use crate::path::PathValidationState;
+pub use crate::path::PathState;
 pub use crate::path::SocketAddrIter;
 
 pub use crate::recovery::CongestionControlAlgorithm;

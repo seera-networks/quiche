@@ -198,6 +198,12 @@ pub enum Frame {
         seq_num: u64,
         status: u64,
     },
+
+    PathSetGroup {
+        group_identifier: u64,
+        seq_num: u64,
+        path_identifiers: Vec<u64>,
+    },
 }
 
 impl Frame {
@@ -364,6 +370,23 @@ impl Frame {
                 }
             },
 
+            0xbaba07 => {
+                let group_identifier = b.get_varint()?;
+                let seq_num = b.get_varint()?;
+                let id_count = b.get_varint()?;
+                let mut path_identifiers = Vec::new();
+                for _ in 0..id_count {
+                    let pid = b.get_varint()?;
+                    path_identifiers.push(pid);
+                }
+                
+                Frame::PathSetGroup {
+                    group_identifier,
+                    seq_num,
+                    path_identifiers,
+                }
+            },
+
             _ => return Err(Error::InvalidFrame),
         };
 
@@ -384,6 +407,7 @@ impl Frame {
             (packet::Type::ZeroRTT, Frame::ACKMP { .. }) => false,
             (packet::Type::ZeroRTT, Frame::PathAbandon { .. }) => false,
             (packet::Type::ZeroRTT, Frame::PathStatus { .. }) => false,
+            (packet::Type::ZeroRTT, Frame::PathSetGroup { .. }) => false,
 
             // ACK, CRYPTO and CONNECTION_CLOSE can be sent on all other packet
             // types.
@@ -651,6 +675,22 @@ impl Frame {
                 b.put_varint(*seq_num)?;
                 b.put_varint(*status)?;
             },
+
+            Frame::PathSetGroup {
+                group_identifier,
+                seq_num,
+                path_identifiers,
+            } => {
+                b.put_varint(0xbaba07)?;
+
+                b.put_varint(*group_identifier)?;
+                b.put_varint(*seq_num)?;
+                b.put_varint(path_identifiers.len() as u64)?;
+                for pid in path_identifiers {
+                    b.put_varint(*pid)?;
+                }                
+            },
+
         }
 
         Ok(before - b.cap())
@@ -879,6 +919,21 @@ impl Frame {
                 path_identifier_size +
                 octets::varint_len(*seq_num) +
                 octets::varint_len(*status)
+            },
+
+            Frame::PathSetGroup {
+                group_identifier,
+                seq_num,
+                path_identifiers,
+            } => {
+                let total_pid_len = path_identifiers.iter()
+                    .map(|pid| octets::varint_len(*pid))
+                    .sum::<usize>();
+                4 + // frame size
+                octets::varint_len(*group_identifier) +
+                octets::varint_len(*seq_num) +
+                octets::varint_len(path_identifiers.len() as u64) +
+                total_pid_len
             },
         }
     }
@@ -1144,6 +1199,17 @@ impl Frame {
                 seq_num: *seq_num,
                 status: *status,
             },
+
+            Frame::PathSetGroup {
+                group_identifier,
+                seq_num,
+                path_identifiers,
+            } => QuicFrame::PathSetGroup {
+                group_identifier: *group_identifier,
+                seq_num: *seq_num,
+                path_identifiers: path_identifiers.clone(),
+            },
+
         }
     }
 }
@@ -1345,6 +1411,17 @@ impl std::fmt::Debug for Frame {
                 write!(
                     f,
                     "PATH_STATUS id_type={identifier_type} path_id={path_identifier:x?} seq_num={seq_num:x} status={status:x}",
+                )?;
+            },
+
+            Frame::PathSetGroup {
+                group_identifier,
+                seq_num,
+                path_identifiers,
+            } => {
+                write!(
+                    f,
+                    "PATH_SET_GROUP group_id={group_identifier:x} seq_num={seq_num:x} path_ids={path_identifiers:?}",
                 )?;
             },
         }
@@ -2528,6 +2605,41 @@ mod tests {
 
         assert_eq!(frame.wire_len(), wire_len);
         assert_eq!(wire_len, 16);
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert_eq!(Frame::from_bytes(&mut b, packet::Type::Short), Ok(frame));
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::Initial).is_err());
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::ZeroRTT).is_err());
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::Handshake).is_err());
+    }
+
+    #[test]
+    fn path_set_group() {
+        let mut d = [42; 128];
+
+        let group_identifier = 0x829f06d7;
+        let seq_num = 0x00;
+        let path_identifiers = vec![0x00, 0x40, 0x4000, 0x40000000];
+
+        let frame = Frame::PathSetGroup {
+            group_identifier,
+            seq_num,
+            path_identifiers,
+        };
+
+        let wire_len = {
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        assert_eq!(frame.wire_len(), wire_len);
+        assert_eq!(wire_len, 29);
 
         let mut b = octets::Octets::with_slice(&d);
         assert_eq!(Frame::from_bytes(&mut b, packet::Type::Short), Ok(frame));

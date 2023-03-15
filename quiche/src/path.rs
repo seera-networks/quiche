@@ -24,9 +24,12 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::convert::TryInto;
+use std::iter::FromIterator;
 use std::time;
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 
@@ -72,7 +75,7 @@ impl PathValidationState {
 
 /// The different usage states of the path.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum PathState {
+pub enum PathState {
     /// The path only sends probing packets.
     Unused,
     /// The path can send non-probing packets.
@@ -156,6 +159,8 @@ pub enum PathEvent {
     /// anymore, unless the application requests probing this path again.
     FailedValidation(SocketAddr, SocketAddr),
 
+    ReturnAvailable(SocketAddr, SocketAddr),
+
     /// The related network path between local `SocketAddr` and peer
     /// `SocketAddr` has been closed and is now unusable on this connection.
     /// An error code and a reason message are provided.
@@ -179,6 +184,10 @@ pub enum PathEvent {
 
     /// The peer advertised the path status for the mentioned 4-tuple.
     PeerPathStatus((SocketAddr, SocketAddr), PathStatus),
+
+    InsertGroup(u64, (SocketAddr, SocketAddr)),
+
+    RemoveGroup(u64, (SocketAddr, SocketAddr)),
 }
 
 /// A network path on which QUIC packets can be sent.
@@ -271,6 +280,8 @@ pub struct Path {
 
     /// The expected sequence number of the PATH_STATUS to be received.
     expected_path_status_seq_num: u64,
+
+    group: HashSet<u64>,
 }
 
 impl Path {
@@ -316,6 +327,7 @@ impl Path {
             migrating: false,
             needs_ack_eliciting: false,
             expected_path_status_seq_num: 0,
+            group: HashSet::new(),
         }
     }
 
@@ -528,6 +540,18 @@ impl Path {
         Ok(())
     }
 
+    fn insert_group(&mut self, group_id: u64) -> bool {
+        self.group.insert(group_id)
+    }
+
+    fn remove_group(&mut self, group_id: u64) -> bool {
+        self.group.remove(&group_id)
+    }
+
+    pub fn group(&self) -> Vec<u64> {
+        self.group.iter().copied().collect::<Vec<_>>()
+    }
+
     #[inline]
     pub fn pop_received_challenge(&mut self) -> Option<[u8; 8]> {
         self.received_challenges.pop_front()
@@ -628,6 +652,7 @@ impl Path {
             stream_retrans_bytes: self.stream_retrans_bytes,
             pmtu: self.recovery.max_datagram_size(),
             delivery_rate: self.recovery.delivery_rate(),
+            group_ids: self.group(),
         }
     }
 }
@@ -660,6 +685,9 @@ pub struct PathMap {
     /// that is used by `addrs_to_paths` and `ConnectionEntry`.
     paths: Slab<Path>,
 
+    /// The groups of the paths
+    groups: BTreeMap<u64, HashSet<usize>>,
+
     /// The maximum number of concurrent paths allowed.
     max_concurrent_paths: usize,
 
@@ -683,6 +711,12 @@ pub struct PathMap {
     path_status_to_advertise: VecDeque<(usize, u64, u64)>,
     /// The sequence number for the next PATH_STATUS.
     next_path_status_seq_num: u64,
+
+    advertise_path_set_group: VecDeque<u64>,
+
+    next_path_set_group_seq_num: u64,
+
+    expected_path_set_group_seq_num: u64,
 }
 
 impl PathMap {
@@ -692,6 +726,7 @@ impl PathMap {
         mut initial_path: Path, max_concurrent_paths: usize, is_server: bool,
     ) -> Self {
         let mut paths = Slab::with_capacity(1); // most connections only have one path
+        let mut groups = BTreeMap::new();
         let mut addrs_to_paths = BTreeMap::new();
 
         let local_addr = initial_path.local_addr;
@@ -700,11 +735,20 @@ impl PathMap {
         // As it is the first path, it is active by default.
         initial_path.state = PathState::Active;
 
+        initial_path.insert_group(0);
+
         let active_path_id = paths.insert(initial_path);
+
         addrs_to_paths.insert((local_addr, peer_addr), active_path_id);
+
+        let mut initial_group = HashSet::new();
+        initial_group.insert(active_path_id);
+
+        groups.insert(0, initial_group);
 
         Self {
             paths,
+            groups,
             max_concurrent_paths,
             addrs_to_paths,
             events: VecDeque::new(),
@@ -713,6 +757,9 @@ impl PathMap {
             path_abandon: VecDeque::new(),
             path_status_to_advertise: VecDeque::new(),
             next_path_status_seq_num: 0,
+            advertise_path_set_group: VecDeque::new(),
+            next_path_set_group_seq_num: 0,
+            expected_path_set_group_seq_num: 0,
         }
     }
 
@@ -880,7 +927,101 @@ impl PathMap {
             self.notify_event(PathEvent::New(local_addr, peer_addr));
         }
 
+        if !self.insert_group(0, pid, is_server)? {
+            warn!("Newly inserted path {pid} already exists!");
+        }
+
         Ok(pid)
+    }
+
+    #[inline]
+    pub fn get_group_ids(&self) -> Vec<u64> {
+        self.groups
+            .iter()
+            .map(|(gid, _)| *gid)
+            .collect::<Vec<_>>()
+    }
+
+    /// Gets an immutable reference to the group identified by `group_id`. If the
+    /// provided `group_id` does not identify any current `PathGroup`, returns an
+    /// [`InvalidState`].
+    ///
+    /// [`InvalidState`]: enum.Error.html#variant.InvalidState
+    #[inline]
+    pub fn get_group(&self, group_id: u64) -> Result<Vec<usize>> {
+        let pids = self.groups
+            .get(&group_id)
+            .ok_or(Error::InvalidState)?
+            .iter()
+            .copied()
+            .collect::<Vec<usize>>();
+        Ok(pids)
+    }
+
+    #[inline]
+    pub fn get_group2(&self, group_id: u64) -> Result<impl Iterator<Item = usize> + '_> {
+        let iter = self.groups
+            .get(&group_id)
+            .ok_or(Error::InvalidState)?
+            .iter()
+            .copied();
+        Ok(iter)
+    }
+
+    /// Records the provided `PathGroup` and returns its assigned identifier.
+    ///
+    /// On success, this method takes care of creating a notification to the
+    /// serving application, if it serves a server-side connection.
+    ///
+    /// [`Done`]: enum.Error.html#variant.Done
+    pub fn insert_group(&mut self, group_id: u64, path_id: usize, is_server: bool) -> Result<bool> {
+        let path = self.get_mut(path_id)?;
+        let local_addr = path.local_addr;
+        let peer_addr = path.peer_addr;
+
+        path.insert_group(group_id);
+
+        if !self.groups.contains_key(&group_id) {
+            self.groups.insert(group_id, HashSet::new());
+        }
+
+        let inserted = self.groups
+            .get_mut(&group_id)
+            .ok_or(Error::InvalidState)?
+            .insert(path_id);
+
+        if inserted && group_id > 0 { 
+            if !is_server {
+                self.mark_advertise_path_set_group(group_id, true);
+            } else {
+                // Notifies the application if we are in server mode.
+                self.notify_event(PathEvent::InsertGroup(group_id, (local_addr, peer_addr)));
+            }
+        }
+        Ok(inserted)
+    }
+
+    pub fn remove_group(&mut self, group_id: u64, path_id: usize, is_server: bool) -> Result<bool> {
+        let path = self.get_mut(path_id)?;
+        let local_addr = path.local_addr;
+        let peer_addr = path.peer_addr;
+
+        path.remove_group(group_id);
+
+        let removed = self.groups
+            .get_mut(&group_id)
+            .ok_or(Error::InvalidState)?
+            .remove(&path_id);
+
+        if removed && group_id > 0 { 
+            if !is_server {
+                self.mark_advertise_path_set_group(group_id, true);
+            } else {
+                // Notifies the application if we are in server mode.
+                self.notify_event(PathEvent::RemoveGroup(group_id, (local_addr, peer_addr)));
+            }
+        }
+        Ok(removed)
     }
 
     /// Notifies a path event to the application served by the connection.
@@ -941,6 +1082,18 @@ impl PathMap {
     /// Returns whether standby paths should be considered to send data packets.
     pub fn consider_standby_paths(&self) -> bool {
         self.iter().filter(|(_, p)| !p.is_standby()).count() == 0
+    }
+
+    pub fn on_challenge_received(&mut self, path_id: usize, data: [u8; 8], is_server: bool) -> Result<()> {
+        let path = self.get_mut(path_id)?;
+        path.on_challenge_received(data);
+        if !is_server {
+            let local_addr = path.local_addr;
+            let peer_addr = path.peer_addr;
+                // Notifies the application.
+                self.notify_event(PathEvent::ReturnAvailable(local_addr, peer_addr));
+        }
+        Ok(())
     }
 
     /// Handles incoming PATH_RESPONSE data.
@@ -1174,6 +1327,68 @@ impl PathMap {
             }
         }
     }
+
+    /// Adds or remove the path ID from the set of paths requiring sending a
+    /// PATH_ABANDON frame.
+    pub fn mark_advertise_path_set_group(&mut self, group_id: u64, advertise: bool) {
+        println!("mark_advertise_path_set_group");
+        if advertise {
+            self.advertise_path_set_group.push_back(group_id);
+        } else {
+            self.advertise_path_set_group.retain(|g| *g != group_id);
+        }
+    }
+
+    /// Returns the Path ID that should be advertised in the next PATH_ABANDON
+    /// frame.
+    pub fn next_advertise_path_set_group(&mut self) -> Option<(u64, u64)> {
+        self.advertise_path_set_group
+            .front()
+            .copied()
+            .map(|gid| {
+                let seq_num = self.next_path_set_group_seq_num;
+                self.next_path_set_group_seq_num += 1;
+                (gid, seq_num)
+            })
+    }
+
+    /// Returns true if the host should send a PATH_SET_GROUP frame.
+    #[inline]
+    pub fn has_path_set_group(&self) -> bool {
+        !self.advertise_path_set_group.is_empty()
+    }
+
+    pub fn on_path_set_group_lost(&mut self, group_id: u64, seq_num: u64) {
+        if self.next_path_set_group_seq_num == seq_num.saturating_add(1) {
+            // No newer Frame sent
+            self.mark_advertise_path_set_group(group_id, true);
+        }
+    }
+
+    pub fn on_path_set_group_received(&mut self, group_id: u64, seq_num: u64, path_ids: Vec<usize>) -> Result<()> {
+        if seq_num >= self.expected_path_set_group_seq_num {
+            self.expected_path_set_group_seq_num = seq_num.saturating_add(1);
+
+            let old_path_ids = self.groups
+                .get(&group_id)
+                .unwrap_or(&HashSet::new())
+                .clone();
+
+            let new_path_ids = HashSet::from_iter(path_ids.into_iter());
+
+            for pid in new_path_ids.difference(&old_path_ids) {
+                self.insert_group(group_id, *pid, true)?;
+            }
+
+            for pid in old_path_ids.difference(&new_path_ids) {
+                self.remove_group(group_id, *pid, true)?;
+            }
+        }
+        Ok(())
+    }
+
+
+
 }
 
 /// Statistics about the path of a connection.
@@ -1246,6 +1461,8 @@ pub struct PathStats {
     /// [`SendInfo.at`]: struct.SendInfo.html#structfield.at
     /// [Pacing]: index.html#pacing
     pub delivery_rate: u64,
+
+    pub group_ids: Vec<u64>,
 }
 
 impl std::fmt::Debug for PathStats {
@@ -1283,6 +1500,12 @@ impl std::fmt::Debug for PathStats {
             f,
             " stream_retrans_bytes={} pmtu={} delivery_rate={}",
             self.stream_retrans_bytes, self.pmtu, self.delivery_rate,
+        )?;
+
+        write!(
+            f,
+            " group_ids={:?}",
+            self.group_ids,
         )
     }
 }

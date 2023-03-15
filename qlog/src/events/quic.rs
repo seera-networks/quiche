@@ -141,7 +141,7 @@ impl PacketHeader {
                 None,
                 None,
                 None,
-                None,
+                dcid,
             ),
 
             _ => PacketHeader::new(
@@ -524,6 +524,12 @@ pub enum QuicFrame {
         path_identifier: Option<u64>,
         seq_num: u64,
         status: u64,
+    },
+
+    PathSetGroup {
+        group_identifier: u64,
+        seq_num: u64,
+        path_identifiers: Vec<u64>,
     },
 
     Unknown {

@@ -28,6 +28,7 @@ use crate::args::*;
 use crate::common::*;
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 
 use std::io::prelude::*;
@@ -173,6 +174,7 @@ pub fn connect(
         &mut config,
     )
     .unwrap();
+    conn.insert_group(local_addr, peer_addr, 2).unwrap();
 
     if let Some(keylog) = &mut keylog {
         if let Ok(keylog) = keylog.try_clone() {
@@ -232,6 +234,7 @@ pub fn connect(
     let mut scid_sent = false;
     let mut new_path_probed = false;
     let mut migrated = false;
+    let mut prepared = false;
 
     loop {
         if !conn.is_in_early_data() || app_proto_selected {
@@ -344,6 +347,7 @@ pub fn connect(
         // established.
         if (conn.is_established() || conn.is_in_early_data()) &&
             (!args.perform_migration || migrated) &&
+            prepared &&
             !app_proto_selected
         {
             // At this stage the ALPN negotiation succeeded and selected a
@@ -441,6 +445,20 @@ pub fn connect(
                     );
                 },
 
+                quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
+                    info!(
+                        "Path ({}, {})'s return path is available",
+                        local_addr, peer_addr
+                    );
+                    conn.insert_group(local_addr, peer_addr, 1).unwrap();
+                    conn.stream_group(0, 1).unwrap();
+                    conn.stream_group(2, 2).unwrap();
+                    conn.stream_group(6, 1).unwrap();
+                    conn.stream_group(10, 2).unwrap();
+                    conn.stream_group(14, 1).unwrap();
+                    prepared = true;
+                }
+
                 quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
                     info!(
                         "Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
@@ -462,6 +480,10 @@ pub fn connect(
                 quiche::PathEvent::PeerMigrated(..) => unreachable!(),
 
                 quiche::PathEvent::PeerPathStatus(..) => {},
+
+                quiche::PathEvent::InsertGroup(..) => unreachable!(),
+
+                quiche::PathEvent::RemoveGroup(..) => unreachable!(),
             }
         }
 
@@ -497,61 +519,21 @@ pub fn connect(
         {
             let additional_local_addr = sockets[1].local_addr().unwrap();
             conn.probe_path(additional_local_addr, peer_addr).unwrap();
-
             new_path_probed = true;
         }
 
+
+        loop {
+            let scheduled_tuples = lowest_latency_scheduler_from_flushables(&conn);
+            let count = output_quic_packet(&mut conn, &sockets, &mut out, &src_addr_to_token, scheduled_tuples)?;
+            if count == 0 {
+                break;
+            }
+        }
         // Determine in which order we are going to iterate over paths.
         let scheduled_tuples = lowest_latency_scheduler(&conn);
 
-        // Generate outgoing QUIC packets and send them on the UDP socket, until
-        // quiche reports that there are no more packets to be sent.
-        for (local_addr, peer_addr) in scheduled_tuples {
-            let token = src_addr_to_token[&local_addr];
-            let socket = &sockets[token];
-            loop {
-                let (write, send_info) = match conn.send_on_path(
-                    &mut out,
-                    Some(local_addr),
-                    Some(peer_addr),
-                ) {
-                    Ok(v) => v,
-
-                    Err(quiche::Error::Done) => {
-                        trace!("{} -> {}: done writing", local_addr, peer_addr);
-                        break;
-                    },
-
-                    Err(e) => {
-                        error!(
-                            "{} -> {}: send failed: {:?}",
-                            local_addr, peer_addr, e
-                        );
-
-                        conn.close(false, 0x1, b"fail").ok();
-                        break;
-                    },
-                };
-
-                if let Err(e) = socket.send_to(&out[..write], send_info.to) {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        trace!(
-                            "{} -> {}: send() would block",
-                            local_addr,
-                            send_info.to
-                        );
-                        break;
-                    }
-
-                    return Err(ClientError::Other(format!(
-                        "{} -> {}: send() failed: {:?}",
-                        local_addr, send_info.to, e
-                    )));
-                }
-
-                trace!("{} -> {}: written {}", local_addr, send_info.to, write);
-            }
-        }
+        output_quic_packet(&mut conn, &sockets, &mut out, &src_addr_to_token, scheduled_tuples)?;
 
         if conn.is_closed() {
             info!(
@@ -653,13 +635,89 @@ fn create_sockets(
     (sockets, src_addrs, first_local_addr.unwrap())
 }
 
+// Generate outgoing QUIC packets and send them on the UDP socket, until
+// quiche reports that there are no more packets to be sent.
+fn output_quic_packet(
+    conn: &mut quiche::Connection,
+    sockets: &Slab<mio::net::UdpSocket>,
+    out: &mut [u8],
+    src_addr_to_token: &HashMap<std::net::SocketAddr, usize>,
+    scheduled_tuples: impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr)>
+) -> Result<usize, ClientError> {
+    let mut count = 0;
+
+    for (local_addr, peer_addr) in scheduled_tuples {
+        println!("local_addr: {}, peer_addr: {}", local_addr, peer_addr);
+        let token = src_addr_to_token[&local_addr];
+        let socket = &sockets[token];
+        loop {
+            let (write, send_info) = match conn.send_on_path(
+                out,
+                Some(local_addr),
+                Some(peer_addr),
+            ) {
+                Ok(v) => v,
+
+                Err(quiche::Error::Done) => {
+                    trace!("{} -> {}: done writing", local_addr, peer_addr);
+                    break;
+                },
+
+                Err(e) => {
+                    error!(
+                        "{} -> {}: send failed: {:?}",
+                        local_addr, peer_addr, e
+                    );
+
+                    conn.close(false, 0x1, b"fail").ok();
+                    break;
+                },
+            };
+
+            if let Err(e) = socket.send_to(&out[..write], send_info.to) {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    trace!(
+                        "{} -> {}: send() would block",
+                        local_addr,
+                        send_info.to
+                    );
+                    break;
+                }
+
+                return Err(ClientError::Other(format!(
+                    "{} -> {}: send() failed: {:?}",
+                    local_addr, send_info.to, e
+                )));
+            }
+
+            trace!("{} -> {}: written {}", local_addr, send_info.to, write);
+            count += 1;
+        }
+    }
+
+    Ok(count)
+}
+
 /// Generate a ordered list of 4-tuples on which the host should send packets,
 /// following a lowest-latency scheduling.
 fn lowest_latency_scheduler(
     conn: &quiche::Connection,
 ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr)> {
     use itertools::Itertools;
+
     conn.path_stats()
+        .sorted_by_key(|p| p.rtt)
+        .map(|p| (p.local_addr, p.peer_addr))
+}
+
+/// Generate a ordered list of 4-tuples on which the host should send packets,
+/// following a lowest-latency scheduling.
+fn lowest_latency_scheduler_from_flushables(
+    conn: &quiche::Connection,
+) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr)> {
+    use itertools::Itertools;
+
+    conn.path_flushable_stats()
         .sorted_by_key(|p| p.rtt)
         .map(|p| (p.local_addr, p.peer_addr))
 }

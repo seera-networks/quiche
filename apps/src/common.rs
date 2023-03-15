@@ -93,6 +93,8 @@ pub struct Client {
 
     pub app_proto_selected: bool,
 
+    pub prepared: bool,
+
     pub partial_requests: std::collections::HashMap<u64, PartialRequest>,
 
     pub partial_responses: std::collections::HashMap<u64, PartialResponse>,

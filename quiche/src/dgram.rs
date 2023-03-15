@@ -27,12 +27,13 @@
 use crate::Error;
 use crate::Result;
 
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 
 /// Keeps track of DATAGRAM frames.
 #[derive(Default)]
 pub struct DatagramQueue {
-    queue: Option<VecDeque<Vec<u8>>>,
+    queue: Option<BTreeMap<u64, VecDeque<Vec<u8>>>>,
     queue_max_len: usize,
     queue_bytes_size: usize,
 }
@@ -46,7 +47,7 @@ impl DatagramQueue {
         }
     }
 
-    pub fn push(&mut self, data: Vec<u8>) -> Result<()> {
+    pub fn push(&mut self, data: Vec<u8>, group_id: u64) -> Result<()> {
         if self.is_full() {
             return Err(Error::Done);
         }
@@ -54,33 +55,67 @@ impl DatagramQueue {
         self.queue_bytes_size += data.len();
         self.queue
             .get_or_insert_with(Default::default)
+            .entry(group_id)
+            .or_insert_with(Default::default)
             .push_back(data);
 
         Ok(())
     }
 
-    pub fn peek_front_len(&self) -> Option<usize> {
-        self.queue.as_ref().and_then(|q| q.front().map(|d| d.len()))
+    pub fn peek_front_len(&self, group_ids: Vec<u64>) -> Option<(u64, usize)> {
+        self.queue
+            .as_ref()
+            .and_then(|map| {
+                group_ids.into_iter()
+                    .filter_map(|group_id| {
+                        map.get(&group_id)
+                            .map(|q| (group_id, q))
+                    })
+                    .find(|(_, q)| !q.is_empty())
+            })
+            .and_then(|(group_id, q)| {
+                q.front()
+                    .map(|d| (group_id, d.len()))
+            })
     }
 
-    pub fn peek_front_bytes(&self, buf: &mut [u8], len: usize) -> Result<usize> {
-        match self.queue.as_ref().and_then(|q| q.front()) {
-            Some(d) => {
+    pub fn peek_front_bytes(&self, buf: &mut [u8], len: usize, group_ids: Vec<u64>) -> Result<(u64, usize)> {
+        match self.queue
+            .as_ref()
+            .and_then(|map| {
+                group_ids.into_iter()
+                    .filter_map(|group_id| {
+                        map.get(&group_id)
+                            .map(|q| (group_id, q))
+                    })
+                    .find(|(_, q)| !q.is_empty())
+            })
+            .map(|(group_id, q)| {
+                (group_id, q.front().expect("empty!?"))
+            })
+        {
+            Some((group_id, d)) => {
                 let len = std::cmp::min(len, d.len());
                 if buf.len() < len {
                     return Err(Error::BufferTooShort);
                 }
 
                 buf[..len].copy_from_slice(&d[..len]);
-                Ok(len)
+                Ok((group_id, len))
             },
 
             None => Err(Error::Done),
         }
     }
 
-    pub fn pop(&mut self) -> Option<Vec<u8>> {
-        if let Some(d) = self.queue.as_mut().and_then(|q| q.pop_front()) {
+    pub fn pop(&mut self, group_id: u64) -> Option<Vec<u8>> {
+        if let Some(d) = self.queue
+            .as_mut()
+            .and_then(|map| {
+                map.get_mut(&group_id)
+            })
+            .and_then(|q| q.pop_front())
+        {
             self.queue_bytes_size = self.queue_bytes_size.saturating_sub(d.len());
             return Some(d);
         }
@@ -89,14 +124,39 @@ impl DatagramQueue {
     }
 
     pub fn has_pending(&self) -> bool {
-        !self.queue.as_ref().map(|q| q.is_empty()).unwrap_or(true)
+        self.queue
+            .as_ref()
+            .map(|map| {
+                map.iter()
+                    .any(|(_, q)| !q.is_empty())
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn get_group_pending(&self) -> Result<u64> {
+        self.queue
+            .as_ref()
+            .and_then(|map| {
+                map.iter()
+                    .find(|(_, q)| !q.is_empty())
+            })
+            .map(|(group_id, _)| *group_id)
+            .ok_or(Error::InvalidState)
     }
 
     pub fn purge<F: Fn(&[u8]) -> bool>(&mut self, f: F) {
-        if let Some(q) = self.queue.as_mut() {
-            q.retain(|d| !f(d));
-            self.queue_bytes_size = q.iter().fold(0, |total, d| total + d.len());
-        }
+        let mut queue_bytes_size = 0;
+        self.queue
+            .as_mut()
+            .map(|map| {
+                map.iter_mut()
+                    .for_each(|(_, q)| {
+                        q.retain(|d| !f(d));
+                        queue_bytes_size +=
+                            q.iter().fold(0, |total, d| total + d.len());
+                    })
+            });
+        self.queue_bytes_size = queue_bytes_size;
     }
 
     pub fn is_full(&self) -> bool {
@@ -104,7 +164,14 @@ impl DatagramQueue {
     }
 
     pub fn len(&self) -> usize {
-        self.queue.as_ref().map(|q| q.len()).unwrap_or(0)
+        self.queue
+            .as_ref()
+            .map(|map| {
+                map.iter()
+                    .map(|(_, q)| q.len())
+                    .sum::<usize>()
+            })
+            .unwrap_or(0)
     }
 
     pub fn byte_size(&self) -> usize {
